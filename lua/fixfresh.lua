@@ -42,8 +42,7 @@ function fixfresh.fetch_ofme(game_name, get)
       return r.body
     end
   end
-  local article = freetp.pick_article(
-    ofme.parse_search(fetch(ofme.SEARCH_URL .. freetp.urlencode(game_name))), game_name)
+  local article = ofme.find_article(game_name, fetch)
   if not article then return nil, "no_page" end
   local tdir = ofme.torrent_dir(fetch(article.url))
   if not tdir then return nil, "no_torrent_dir" end

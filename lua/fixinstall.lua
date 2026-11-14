@@ -330,15 +330,130 @@ function fixinstall.list_archives(home, deps)
   return fixinstall.filter_archives(kept)
 end
 
--- detect_local(install_path, deps) -> { found, broken }: is a REAL fix
--- installed in this game folder? A fix announces itself with a loader list
+-- How deep the fix scan walks below the game root. Unreal and Unity depots
+-- nest their payload (Satisfactory keeps the fix in Engine/Binaries/Win64), so
+-- a root+one-level scan reported "no fix" for a correctly installed one.
+fixinstall.FIX_SCAN_DEPTH = 4
+-- Ceiling on entries visited; the scan runs on the single-threaded RPC loop.
+fixinstall.FIX_SCAN_MAX_ENTRIES = 20000
+
+-- scan_fix_files(root, fs_mod) -> { { name, path } } for every file under root
+-- within FIX_SCAN_DEPTH, breadth-first, capped at FIX_SCAN_MAX_ENTRIES.
+-- Unreadable directories are skipped. fs_mod follows Lumen's fs.list contract.
+function fixinstall.scan_fix_files(root, fs_mod)
+  local out, seen = {}, 0
+  if type(root) ~= "string" or root == "" or type(fs_mod) ~= "table"
+      or type(fs_mod.list) ~= "function" then
+    return out
+  end
+  local queue, head = { { dir = root, depth = 0 } }, 1
+  while head <= #queue do
+    local item = queue[head]
+    head = head + 1
+    local ok, entries = pcall(fs_mod.list, item.dir)
+    for _, e in ipairs(ok and type(entries) == "table" and entries or {}) do
+      if type(e) == "table" then
+        seen = seen + 1
+        if seen > fixinstall.FIX_SCAN_MAX_ENTRIES then return out end
+        local path = tostring(e.path or "")
+        if path == "" and e.name then path = item.dir .. "/" .. tostring(e.name) end
+        if e.is_directory then
+          if item.depth + 1 < fixinstall.FIX_SCAN_DEPTH then
+            queue[#queue + 1] = { dir = path, depth = item.depth + 1 }
+          end
+        else
+          out[#out + 1] = { name = tostring(e.name or ""), path = path }
+        end
+      end
+    end
+  end
+  return out
+end
+
+-- parse_fix_appids(text) -> realAppId, fakeAppId from an OnlineFix/SteamFix
+-- ini body. Both spellings seen in the wild are accepted; a missing, zero or
+-- self-referential fake id means the fix needs no appid swap. PURE.
+function fixinstall.parse_fix_appids(text)
+  if type(text) ~= "string" then return nil, nil end
+  local real = text:match("\n%s*RealAppId%s*=%s*(%d+)") or text:match("^RealAppId%s*=%s*(%d+)")
+  local fake = text:match("\n%s*FakeAppId%s*=%s*(%d+)") or text:match("^FakeAppId%s*=%s*(%d+)")
+  real, fake = tonumber(real), tonumber(fake)
+  if not fake or fake <= 0 then return real, nil end
+  if real and real == fake then return real, nil end
+  return real, fake
+end
+
+local function read_text_file(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local data = f:read("*a")
+  f:close()
+  return data
+end
+
+-- read_fix_appids(install_dir, files, deps) -> real, fake, ini_path.
+-- Reads the appid pair the fix's own config declares. `files` is an existing
+-- scan (or nil to scan); deps.read_file is injectable for tests.
+function fixinstall.read_fix_appids(install_dir, files, deps)
+  deps = deps or {}
+  local read_file = deps.read_file or read_text_file
+  local list = files
+  if not list then
+    local fs_mod = deps.fs
+    if not fs_mod then
+      local ok, f = pcall(require, "fs")
+      fs_mod = ok and f or nil
+    end
+    list = fixinstall.scan_fix_files(install_dir, fs_mod)
+  end
+  for _, e in ipairs(list) do
+    local low = tostring(e.name or ""):lower()
+    if low == "onlinefix.ini" or low == "steamfix.ini" then
+      local real, fake = fixinstall.parse_fix_appids(read_file(e.path) or "")
+      return real, fake, e.path
+    end
+  end
+  return nil, nil, nil
+end
+
+-- sync_fake_appid(appid, install_dir, deps) -> { success, fakeAppId, status }
+-- or nil when the fix declares no swap. `deps.ini_path` skips the scan when the
+-- caller already knows where the fix's config landed (install does).
+-- Applies the appid swap a Windows online fix declares in its own config
+-- (FakeAppId) through SLSsteam's FakeAppIds map. A Windows fix makes the game
+-- report the fake AppID at the client layer; without the same swap on Linux the
+-- lobby is hosted/joined under another AppID and SteamNetworkingSockets refuses
+-- the P2P cert ("Cert is not authorized for appid X, only 480").
+function fixinstall.sync_fake_appid(appid, install_dir, deps)
+  deps = deps or {}
+  appid = tonumber(appid)
+  if not appid then return nil end
+  if type(install_dir) ~= "string" and type(deps.ini_path) ~= "string" then return nil end
+  local read_file = deps.read_file or read_text_file
+  local real, fake
+  if type(deps.ini_path) == "string" then
+    real, fake = fixinstall.parse_fix_appids(read_file(deps.ini_path) or "")
+  else
+    real, fake = fixinstall.read_fix_appids(install_dir, nil, deps)
+  end
+  if not fake then return nil end
+  if real and real ~= appid then return nil end
+  local ok_sls, sls = pcall(require, "slsteam")
+  if not (ok_sls and sls and sls.set_fake_appid) then
+    return { success = false, fakeAppId = fake, status = "slsteam_unavailable" }
+  end
+  local ok, status = sls.set_fake_appid(appid, fake)
+  return { success = ok == true, fakeAppId = fake, status = tostring(status or "") }
+end
+
+-- detect_local(install_path, deps) -> { found, broken, fakeAppId }: is a REAL
+-- fix installed in this game folder? A fix announces itself with a loader list
 -- file (winmm.txt / dlllist.txt), a fix config (onlinefix.ini /
 -- steamfix.ini), or a fix payload DLL (onlinefix*/steamfix*). A proxy DLL
 -- (winmm/winhttp/version) alone is not enough: mod loaders such as BepInEx
--- ship one too. Only the install root and its direct subfolders (depots that
--- nest the game one level down) are scanned, and only for these fix-specific
--- names: a game-shipped DirectX redist (D3D12/D3D12Core.dll) must NEVER read
--- as "a fix is installed". deps.fs is injectable for tests.
+-- ship one too. Only fix-specific names count: a game-shipped DirectX redist
+-- (D3D12/D3D12Core.dll) must NEVER read as "a fix is installed". deps.fs is
+-- injectable for tests.
 function fixinstall.detect_local(install_path, deps)
   deps = deps or {}
   local res = { found = false, broken = false }
@@ -349,21 +464,9 @@ function fixinstall.detect_local(install_path, deps)
     fs_mod = ok and f or nil
   end
   if type(fs_mod) ~= "table" or type(fs_mod.list) ~= "function" then return res end
-  local ok, entries = pcall(fs_mod.list, install_path)
-  if not ok or type(entries) ~= "table" then return res end
-  local files = {}
-  for _, e in ipairs(entries) do
-    if type(e) == "table" and e.is_directory then
-      local ok_sub, sub = pcall(fs_mod.list, install_path .. "/" .. tostring(e.name))
-      for _, s in ipairs(ok_sub and type(sub) == "table" and sub or {}) do
-        if type(s) == "table" and not s.is_directory then files[#files + 1] = s end
-      end
-    elseif type(e) == "table" then
-      files[#files + 1] = e
-    end
-  end
+  local files = fixinstall.scan_fix_files(install_path, fs_mod)
   local proxies = { winmm = true, winhttp = true, version = true }
-  local proxy, loader = false, false
+  local proxy, loader, ini_path = false, false, nil
   for _, e in ipairs(files) do
     local low = tostring(e.name or ""):lower()
     local stem = low:match("^(.-)%.dll$")
@@ -372,12 +475,18 @@ function fixinstall.detect_local(install_path, deps)
     if low == "onlinefix.ini" or low == "steamfix.ini"
         or (stem and (stem:match("^onlinefix%d*$") or stem:match("^steamfix%d*$"))) then
       res.found = true
+      if low == "onlinefix.ini" or low == "steamfix.ini" then ini_path = e.path end
     end
   end
   res.found = res.found or loader
   -- A loader list without its proxy DLL cannot load (LuaTools' UnFixGame
   -- deletes winmm.dll even when no fix of its own is recorded).
   res.broken = loader and not proxy
+  -- The appid the fix itself asks for, so the menu can show/offer the swap.
+  if ini_path then
+    local _, fake = fixinstall.parse_fix_appids((deps.read_file or read_text_file)(ini_path) or "")
+    res.fakeAppId = fake
+  end
   return res
 end
 
@@ -412,6 +521,21 @@ local function resolve_install_default(appid)
   local ok, su = pcall(require, "steam_utils")
   if ok and su and su.get_game_install_path_response then
     return su.get_game_install_path_response(appid)
+  end
+  return nil
+end
+
+-- resolve_install_dir(appid, deps) -> Steam's install path for appid, or nil.
+-- The single place that answers "where is this game", so the install, the RPC
+-- and the boot reconcile cannot drift apart.
+function fixinstall.resolve_install_dir(appid, deps)
+  deps = deps or {}
+  appid = tonumber(appid)
+  if not appid then return nil end
+  local info = (deps.resolve_install or resolve_install_default)(appid)
+  if type(info) == "table" and info.success == true
+      and type(info.installPath) == "string" and info.installPath ~= "" then
+    return info.installPath
   end
   return nil
 end
@@ -571,8 +695,17 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
   -- even when empty, which reads as "no override needed". One already there
   -- belongs to a LuaTools fix and is left alone.
   local dll_list = install_dir .. "/" .. FIX_DLL_LIST
-  local write_dll_list = not exists(dll_list)
-  if write_dll_list then added[#added + 1] = FIX_DLL_LIST end
+  -- Rewrite the list when we wrote it last time (a re-apply with a different
+  -- archive must not keep the previous fix's override set); a list we do not
+  -- own belongs to the LuaTools downloader or a manual fix and is left alone.
+  local dll_list_owned = false
+  if prev and type(prev.added) == "table" then
+    for _, p in ipairs(prev.added) do
+      if p == FIX_DLL_LIST then dll_list_owned = true break end
+    end
+  end
+  local write_dll_list = dll_list_owned or not exists(dll_list)
+  if not exists(dll_list) then added[#added + 1] = FIX_DLL_LIST end
   -- Even when this archive picks another game root: revert only counts them.
   if prev and type(prev.replaced) == "table" then
     for _, p in ipairs(prev.replaced) do
@@ -625,6 +758,30 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
     if f then
       f:write(fixinstall.fix_dll_list(entries))
       f:close()
+    end
+  end
+
+  -- A Windows online fix swaps the AppID at the client layer itself; the same
+  -- swap has to happen in SLSsteam, or this side reports the real AppID while
+  -- the other players' fixes report the fake one and SteamNetworkingSockets
+  -- refuses the P2P cert. The ini path comes from the archive listing, so no
+  -- second tree scan is needed. Best-effort: a failure leaves files installed.
+  local ini_path
+  for _, e in ipairs(entries) do
+    local low = e.path:match("[^/]+$"):lower()
+    if low == "onlinefix.ini" or low == "steamfix.ini" then
+      ini_path = install_dir .. "/" .. e.path
+      break
+    end
+  end
+  local ok_sync, synced = pcall(fixinstall.sync_fake_appid, appid, install_dir,
+    { read_file = deps.read_file, ini_path = ini_path })
+  if ok_sync and type(synced) == "table" and synced.success then
+    res.fakeAppId = synced.fakeAppId
+    local rec = read_manifest(root)
+    if type(rec) == "table" then
+      rec.fakeAppId = res.fakeAppId
+      write_manifest(root, json.encode(rec), deps.open_file or io.open)
     end
   end
 
@@ -686,14 +843,144 @@ function fixinstall.revert(appid, deps)
   res.removed = removed
   res.replacedCount = #(type(m.replaced) == "table" and m.replaced or {})
   res.needsVerify = res.replacedCount > 0
+  -- Drop only the swap this record installed: a mapping the user set by hand (or
+  -- the SpaceFix tile) survives, because the recorded id must still match.
+  local recorded_fake = tonumber(m.fakeAppId)
+  if recorded_fake then
+    local ok_sls, sls = pcall(require, "slsteam")
+    if ok_sls and sls and sls.get_fake_appid and sls.unset_fake_appid
+        and tonumber(sls.get_fake_appid(appid)) == recorded_fake then
+      pcall(sls.unset_fake_appid, appid)
+      res.fakeAppIdCleared = recorded_fake
+    end
+  end
   os.execute("rm -rf -- " .. shq(root))
   res.reverted = true
   return res
 end
 
+-- managed_appids(deps) -> sorted list of appids SLSsteam manages, from the
+-- stplug-in scripts the client reads. Those are exactly the games whose online
+-- fix the Fixes menu can be used on, whichever path installed it.
+function fixinstall.managed_appids(deps)
+  deps = deps or {}
+  local home = deps.home or os.getenv("HOME") or ""
+  if home == "" then return {} end
+  local dir = deps.stplug_dir or (home .. "/.steam/steam/config/stplug-in")
+  local list_dir = deps.list_dir
+  if not list_dir and type(deps.fs) == "table" and type(deps.fs.list) == "function" then
+    list_dir = deps.fs.list
+  end
+  if not list_dir then
+    list_dir = function(d)
+      local ok_fs, fs_mod = pcall(require, "fs")
+      if not (ok_fs and type(fs_mod) == "table" and type(fs_mod.list) == "function") then
+        return {}
+      end
+      local ok, entries = pcall(fs_mod.list, d)
+      return ok and type(entries) == "table" and entries or {}
+    end
+  end
+  local ids, seen = {}, {}
+  for _, e in ipairs(list_dir(dir)) do
+    local name = tostring(e.name or "")
+    local id = tonumber(name:match("^(%d+)%.lua$"))
+    if id and not seen[id] then
+      seen[id] = true
+      ids[#ids + 1] = id
+    end
+  end
+  table.sort(ids)
+  return ids
+end
+
+-- reconcile_fake_appids(deps) -> { checked, applied, skipped }.
+-- Runs at boot so a fix installed by ANY path (LuaTools' own downloader, the
+-- FreeTP/online-fix archive install, a manual extraction) gets the appid swap
+-- its own config declares. It never invents a mapping: a game whose fix config
+-- declares no FakeAppId is left alone, an existing mapping is never
+-- overwritten, and a game with no fix on disk is skipped.
+function fixinstall.reconcile_fake_appids(deps)
+  deps = deps or {}
+  local out = { checked = 0, applied = 0, skipped = 0 }
+  local ok_sls, sls = pcall(require, "slsteam")
+  if not (ok_sls and sls and sls.get_fake_appid and sls.set_fake_appid) then return out end
+  local fs_mod = deps.fs
+  if not fs_mod then
+    local ok_fs, f = pcall(require, "fs")
+    fs_mod = ok_fs and f or nil
+  end
+  if type(fs_mod) ~= "table" or type(fs_mod.list) ~= "function" then return out end
+  local resolve = deps.resolve_install
+  if not resolve then
+    local ok_su, su = pcall(require, "steam_utils")
+    if not (ok_su and type(su) == "table" and su.get_game_install_path_response) then return out end
+    resolve = function(id)
+      local ok, info = pcall(su.get_game_install_path_response, id)
+      return ok and type(info) == "table" and info.success == true and info.installPath or nil
+    end
+  end
+  for _, id in ipairs(fixinstall.managed_appids(deps)) do
+    out.checked = out.checked + 1
+    local install_dir = resolve(id)
+    local current = tonumber(sls.get_fake_appid(id))
+    if not install_dir or current then
+      out.skipped = out.skipped + 1
+    else
+      local detected = fixinstall.detect_local(install_dir, { fs = fs_mod })
+      local fake = detected and detected.fakeAppId
+      if not fake then
+        out.skipped = out.skipped + 1
+      else
+        local ok, status = sls.set_fake_appid(id, fake)
+        if ok == true then out.applied = out.applied + 1 else out.skipped = out.skipped + 1 end
+      end
+    end
+  end
+  return out
+end
+
 -- register(registry, deps): `deps` reaches install and revert — inject it
 -- from tests; production leaves it nil.
 function fixinstall.register(registry, deps)
+  -- A fix applied before this module knew about appid swaps (or by the plugin's
+  -- own downloader) still needs the mapping once SLSsteam is up. Boot is the
+  -- only moment that is guaranteed to run after the client injected the hook.
+  pcall(fixinstall.reconcile_fake_appids, deps)
+
+  -- The plugin's own downloader extracts a Windows fix without ever touching the
+  -- client layer, so its completion path asks for the swap explicitly. Returns
+  -- { success, applied, fakeAppId } — `applied` is false when the fix declares
+  -- no swap, which is a normal answer, not a failure.
+  registry.LumenSyncFixAppId = function(appid, contentScriptQuery, installPath)
+    if type(appid) == "table" then
+      installPath = appid.installPath
+      appid = appid.appid
+    end
+    appid = tonumber(appid)
+    local res = { success = true, applied = false }
+    if not appid then return json.encode({ success = false, error = "invalid_appid" }) end
+    local dir = trusted_install_dir(appid, installPath, deps and deps.resolve_install)
+    if not dir then
+      dir = fixinstall.resolve_install_dir(appid, deps)
+    end
+    if not dir then return json.encode({ success = false, error = "not_installed" }) end
+    local ok, synced = pcall(fixinstall.sync_fake_appid, appid, dir, deps)
+    if ok and type(synced) == "table" then
+      res.applied = synced.success == true
+      res.fakeAppId = synced.fakeAppId
+      res.status = synced.status
+      if res.applied then
+        local root = (deps and deps.store_root or store_root)() .. "/" .. appid
+        local rec = read_manifest(root)
+        if type(rec) == "table" and rec.fakeAppId ~= synced.fakeAppId then
+          rec.fakeAppId = synced.fakeAppId
+          write_manifest(root, json.encode(rec), deps and deps.open_file or io.open)
+        end
+      end
+    end
+    return json.encode(res)
+  end
   -- Bridge contract: JS object keys arrive alphabetically positional; the
   -- table form is tolerated too.
   registry.LumenDetectLocalFix = function(appid, contentScriptQuery, installPath)
@@ -705,9 +992,12 @@ function fixinstall.register(registry, deps)
     local res = { success = true, found = false }
     local dir = appid and trusted_install_dir(appid, installPath)
     if not dir then return json.encode(res) end
-    local ok, det = pcall(fixinstall.detect_local, dir)
+    local ok, det = pcall(fixinstall.detect_local, dir, deps)
     res.found = ok and type(det) == "table" and det.found == true
     res.broken = res.found and det.broken == true
+    if res.found and type(det) == "table" and det.fakeAppId then
+      res.fakeAppId = det.fakeAppId
+    end
     local m = read_manifest((deps and deps.store_root or store_root)() .. "/" .. appid)
     res.recorded = m and m.source or nil
     return json.encode(res)

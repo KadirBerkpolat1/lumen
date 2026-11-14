@@ -1738,20 +1738,33 @@
           setTimeout(poll, 600);
         } else if (st.status === "done") {
           if (bar) bar.style.transform = "scaleX(1)";
-          fxApplyOverrides(appid, ctx, win).then(function (launchApplied) {
-            if (!officialFixId || !launchApplied) return { success: launchApplied };
-            return call("CompleteLuaToolsFixApply", {
-              appid: appid, fixId: officialFixId, contentScriptQuery: "",
-            }).then(fxParse);
-          }).then(function (completed) {
-            if (officialFixId && !(completed && completed.success)) {
-              fxFailProgress(win, (completed && completed.error) || S.launchApplyFailed);
-            } else {
-              fxFinish(win, true, { title: fixesFill(S.appliedOk, { fix: fixType }), text: S.appliedDetail });
-            }
-          }).catch(function () {
-            fxFailProgress(win, S.launchApplyFailed);
-          });
+          // A Windows online fix swaps the AppID at the client layer; without
+          // the same swap here the lobby is hosted under a different AppID and
+          // the P2P handshake is refused. Applied before the completion RPC so
+          // a failed swap still reports the fix as installed.
+          Promise.resolve()
+            .then(function () {
+              return call("LumenSyncFixAppId", {
+                appid: appid, installPath: ctx.installPath || "", contentScriptQuery: "",
+              }).then(fxParse).catch(function () { return null; });
+            })
+            .then(function () { return fxApplyOverrides(appid, ctx, win); })
+            .then(function (launchApplied) {
+              if (!officialFixId || !launchApplied) return { success: launchApplied };
+              return call("CompleteLuaToolsFixApply", {
+                appid: appid, fixId: officialFixId, contentScriptQuery: "",
+              }).then(fxParse);
+            })
+            .then(function (completed) {
+              if (officialFixId && !(completed && completed.success)) {
+                fxFailProgress(win, (completed && completed.error) || S.launchApplyFailed);
+              } else {
+                fxFinish(win, true, { title: fixesFill(S.appliedOk, { fix: fixType }), text: S.appliedDetail });
+              }
+            })
+            .catch(function () {
+              fxFailProgress(win, S.launchApplyFailed);
+            });
         } else if (st.status === "failed") {
           if (fixesAuthExpired(st)) {
             // The source refused the download. Report what it said and offer the

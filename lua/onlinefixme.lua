@@ -44,6 +44,21 @@ function ofme.parse_search(html)
   return out
 end
 
+-- find_article(game_name, fetch) -> matching article { url, title } or nil.
+-- Like freetp.org, online-fix.me runs DLE, which rejects punctuated acronyms
+-- such as "R.E.P.O." (<3-char tokens) until punctuation is stripped ("REPO").
+function ofme.find_article(game_name, fetch)
+  local article = freetp.pick_article(
+    ofme.parse_search(fetch(ofme.SEARCH_URL .. freetp.urlencode(game_name))), game_name)
+  if article then return article end
+  local plain = freetp.plain_query(game_name)
+  if plain ~= "" and plain ~= game_name then
+    article = freetp.pick_article(
+      ofme.parse_search(fetch(ofme.SEARCH_URL .. freetp.urlencode(plain))), game_name)
+  end
+  return article
+end
+
 -- torrent_dir(html) -> the article's uploads-server torrent folder, or nil. PURE.
 function ofme.torrent_dir(html)
   return type(html) == "string"
@@ -162,8 +177,7 @@ function ofme.start(appid, game_name, deps)
     end
   end
 
-  local article = freetp.pick_article(
-    ofme.parse_search(fetch(ofme.SEARCH_URL .. freetp.urlencode(game_name))), game_name)
+  local article = ofme.find_article(game_name, fetch)
   local tdir = article and ofme.torrent_dir(fetch(article.url))
   local tname = tdir and (fetch(tdir) or ""):match('href="([^"]+%.torrent)"')
   local torrent = tname and fetch(tdir .. tname)
