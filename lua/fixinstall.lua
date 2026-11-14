@@ -416,6 +416,42 @@ function fixinstall.read_fix_appids(install_dir, files, deps)
   return nil, nil, nil
 end
 
+-- fake_appid_store() -> { set_fake_appid, get_fake_appid, unset_fake_appid }
+-- The plugin backend ships a slsteam module that edits config.yaml and also
+-- quarantines the app-scoped cache the change invalidates. That module lives
+-- only in LUMEN_BACKEND_DIR, so a plugin-less Lumen (--noplugin, or a bare
+-- settings-menu install) cannot load it -- and then the whole appid swap
+-- silently degrades to status "slsteam_unavailable", which is exactly the
+-- "Cert is not authorized" P2P failure this code exists to prevent.
+-- slsconfig is core (always present) and now owns the same map editor, so it is
+-- the fallback. The plugin path is preferred because it also invalidates the
+-- cached appinfo the swap makes stale.
+local fake_appid_store
+function fixinstall.fake_appid_store()
+  if fake_appid_store ~= nil then return fake_appid_store or nil end
+  local ok_sls, sls = pcall(require, "slsteam")
+  if ok_sls and type(sls) == "table" and sls.set_fake_appid then
+    fake_appid_store = sls
+    return sls
+  end
+  local ok_cfg, cfg = pcall(require, "slsconfig")
+  if not (ok_cfg and type(cfg) == "table" and cfg.set_fake_appid) then
+    fake_appid_store = false
+    return nil
+  end
+  local path = cfg.default_path()
+  if not path then
+    fake_appid_store = false
+    return nil
+  end
+  fake_appid_store = {
+    set_fake_appid = function(appid, fake) return cfg.set_fake_appid(path, appid, fake) end,
+    unset_fake_appid = function(appid) return cfg.unset_fake_appid(path, appid) end,
+    get_fake_appid = function(appid) return cfg.get_fake_appid(path, appid) end,
+  }
+  return fake_appid_store
+end
+
 -- sync_fake_appid(appid, install_dir, deps) -> { success, fakeAppId, status }
 -- or nil when the fix declares no swap. `deps.ini_path` skips the scan when the
 -- caller already knows where the fix's config landed (install does).
@@ -438,9 +474,9 @@ function fixinstall.sync_fake_appid(appid, install_dir, deps)
   end
   if not fake then return nil end
   if real and real ~= appid then return nil end
-  local ok_sls, sls = pcall(require, "slsteam")
-  if not (ok_sls and sls and sls.set_fake_appid) then
-    return { success = false, fakeAppId = fake, status = "slsteam_unavailable" }
+  local sls = fixinstall.fake_appid_store()
+  if not (sls and sls.set_fake_appid) then
+    return { success = false, fakeAppId = fake, status = "config_unavailable" }
   end
   local ok, status = sls.set_fake_appid(appid, fake)
   return { success = ok == true, fakeAppId = fake, status = tostring(status or "") }
@@ -847,8 +883,8 @@ function fixinstall.revert(appid, deps)
   -- the SpaceFix tile) survives, because the recorded id must still match.
   local recorded_fake = tonumber(m.fakeAppId)
   if recorded_fake then
-    local ok_sls, sls = pcall(require, "slsteam")
-    if ok_sls and sls and sls.get_fake_appid and sls.unset_fake_appid
+    local sls = fixinstall.fake_appid_store()
+    if sls and sls.get_fake_appid and sls.unset_fake_appid
         and tonumber(sls.get_fake_appid(appid)) == recorded_fake then
       pcall(sls.unset_fake_appid, appid)
       res.fakeAppIdCleared = recorded_fake
@@ -903,8 +939,8 @@ end
 function fixinstall.reconcile_fake_appids(deps)
   deps = deps or {}
   local out = { checked = 0, applied = 0, skipped = 0 }
-  local ok_sls, sls = pcall(require, "slsteam")
-  if not (ok_sls and sls and sls.get_fake_appid and sls.set_fake_appid) then return out end
+  local sls = fixinstall.fake_appid_store()
+  if not (sls and sls.get_fake_appid and sls.set_fake_appid) then return out end
   local fs_mod = deps.fs
   if not fs_mod then
     local ok_fs, f = pcall(require, "fs")

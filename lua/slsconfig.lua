@@ -328,4 +328,192 @@ function slsconfig.reset_to_defaults(path, cr_present)
   return true
 end
 
+-- ── FakeAppIds map editor ────────────────────────────────────────────────────
+-- FakeAppIds is a block map, not a scalar, so it is out of SCHEMA's scope:
+--
+--   FakeAppIds:
+--     526870: 480
+--
+-- Its own editor lives here rather than in the LuaTools plugin backend because
+-- fixinstall.lua needs it in --noplugin mode too: a plugin-less Lumen still
+-- runs the Fixes Menu, and a fix that swaps the AppID is useless without the
+-- swap reaching config.yaml. Same byte-preserving, atomic contract as write_key.
+
+local function split_lines(text)
+  local lines = {}
+  local had_trailing_nl = (#text > 0 and text:sub(-1) == "\n")
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  if had_trailing_nl then lines[#lines] = nil end
+  return lines, had_trailing_nl
+end
+
+local function join_lines(lines, had_trailing_nl)
+  local body = table.concat(lines, "\n")
+  if had_trailing_nl and #lines > 0 then body = body .. "\n" end
+  return body
+end
+
+-- Locate the FakeAppIds header line. Returns nil when absent.
+function slsconfig.fakeappids_header(lines)
+  for i, line in ipairs(lines) do
+    if line:match("^FakeAppIds%s*:") then return i end
+  end
+  return nil
+end
+
+-- A header with an inline value ("FakeAppIds: {480: 480}") cannot be edited
+-- line-wise; report it so callers refuse instead of corrupting the file.
+function slsconfig.fakeappids_is_inline(lines, header_idx)
+  if not header_idx then return false end
+  local after = lines[header_idx]:match("^FakeAppIds%s*:%s*(.-)%s*$") or ""
+  return (after:gsub("#.*$", ""):gsub("%s+$", "")) ~= ""
+end
+
+-- scan_map_block(lines, header_idx) -> entries, last_entry_idx, indent
+-- entries[key] = { idx = line_index, value = "<stripped value>" }.
+-- Stops at the first non-entry line, which is how the next top-level key ends
+-- the block. Comments and blank lines inside the block are skipped but do not
+-- end it, so a hand-annotated map stays editable.
+function slsconfig.scan_map_block(lines, header_idx)
+  local entries, last_entry_idx, indent = {}, header_idx, "  "
+  for i = header_idx + 1, #lines do
+    local line = lines[i]
+    local stripped = line:gsub("^%s+", "")
+    if stripped == "" or stripped:match("^#") then
+      -- belongs to whichever section follows; skip without ending the block
+    else
+      local entry_indent, key, val = line:match("^(%s+)(%d+)%s*:%s*(.-)%s*$")
+      if not entry_indent then break end
+      indent = entry_indent
+      last_entry_idx = i
+      local keynum = tonumber(key)
+      if keynum then
+        entries[keynum] = { idx = i, value = (val:gsub("#.*$", ""):gsub("%s+$", "")) }
+      end
+    end
+  end
+  return entries, last_entry_idx, indent
+end
+
+-- set_fake_appid_text(text, appid, fake) -> new_text, status
+-- Pure. status is "added", "updated" or "already_present". Refuses (".", msg)
+-- when the header has an inline value.
+function slsconfig.set_fake_appid_text(text, appid, fake)
+  appid, fake = tonumber(appid), tonumber(fake)
+  if not appid or not fake then return nil, "invalid appid" end
+  local lines, had_trailing_nl = split_lines(text or "")
+
+  local header_idx = slsconfig.fakeappids_header(lines)
+  if not header_idx then
+    if #lines > 0 and lines[#lines] ~= "" then lines[#lines + 1] = "" end
+    lines[#lines + 1] = "FakeAppIds:"
+    header_idx = #lines
+  elseif slsconfig.fakeappids_is_inline(lines, header_idx) then
+    return nil, "FakeAppIds: has an inline value, refusing to rewrite"
+  end
+
+  local entries, last_entry_idx, indent = slsconfig.scan_map_block(lines, header_idx)
+  local existing = entries[appid]
+  if existing then
+    if existing.value == tostring(fake) then return text, "already_present" end
+    lines[existing.idx] = indent .. tostring(appid) .. ": " .. tostring(fake)
+    return join_lines(lines, had_trailing_nl), "updated"
+  end
+
+  table.insert(lines, last_entry_idx + 1, indent .. tostring(appid) .. ": " .. tostring(fake))
+  return join_lines(lines, had_trailing_nl), "added"
+end
+
+-- unset_fake_appid_text(text, appid) -> new_text, status
+-- status is "removed" or "not_present".
+function slsconfig.unset_fake_appid_text(text, appid)
+  appid = tonumber(appid)
+  if not appid then return nil, "invalid appid" end
+  local lines, had_trailing_nl = split_lines(text or "")
+  local header_idx = slsconfig.fakeappids_header(lines)
+  if not header_idx or slsconfig.fakeappids_is_inline(lines, header_idx) then
+    return text, "not_present"
+  end
+  local entries = slsconfig.scan_map_block(lines, header_idx)
+  local existing = entries[appid]
+  if not existing then return text, "not_present" end
+  table.remove(lines, existing.idx)
+  return join_lines(lines, had_trailing_nl), "removed"
+end
+
+-- get_fake_appid_text(text, appid) -> number|nil. Pure read.
+function slsconfig.get_fake_appid_text(text, appid)
+  appid = tonumber(appid)
+  if not appid then return nil end
+  local lines = split_lines(text or "")
+  local header_idx = slsconfig.fakeappids_header(lines)
+  if not header_idx or slsconfig.fakeappids_is_inline(lines, header_idx) then return nil end
+  local entries = slsconfig.scan_map_block(lines, header_idx)
+  local e = entries[appid]
+  return e and tonumber(e.value) or nil
+end
+
+-- edit_map(path, fn) -> ok, status|err. Reads the config, runs `fn(text)` and
+-- writes the result back atomically. Shares write_key's no-clobber guard: an
+-- empty or unrecognisable config is never rewritten, because set_key's sibling
+-- logic would otherwise "append" onto a truncated read and destroy the file.
+local function edit_config_text(path, fn)
+  if not path then return false, "no path" end
+  local f = io.open(path, "rb")
+  if not f then return false, "config.yaml not found" end
+  local data = f:read("*a") or ""
+  f:close()
+  if data == "" then
+    return false, "config empty/unreadable; refusing to overwrite"
+  end
+  if count_known_keys(data) < 3 then
+    return false, "config does not look valid; refusing to write"
+  end
+
+  local out, status = fn(data)
+  if out == nil then return false, status or "edit failed" end
+  if out == data then return true, status end
+
+  local tmp = string.format("%s.tmp.lumen.%d.%d.%d", path,
+    os.time(), (write_seq), math.random(100000, 999999))
+  write_seq = write_seq + 1
+  local w, werr = io.open(tmp, "wb")
+  if not w then return false, werr or "open failed" end
+  w:write(out)
+  w:close()
+  local ok, rerr = os.rename(tmp, path)
+  if not ok then
+    os.remove(tmp)
+    return false, rerr or "rename failed"
+  end
+  return true, status
+end
+
+-- set_fake_appid(path, appid, fake) -> ok, status
+function slsconfig.set_fake_appid(path, appid, fake)
+  return edit_config_text(path, function(text)
+    return slsconfig.set_fake_appid_text(text, appid, fake)
+  end)
+end
+
+-- unset_fake_appid(path, appid) -> ok, status
+function slsconfig.unset_fake_appid(path, appid)
+  return edit_config_text(path, function(text)
+    return slsconfig.unset_fake_appid_text(text, appid)
+  end)
+end
+
+-- get_fake_appid(path, appid) -> number|nil
+function slsconfig.get_fake_appid(path, appid)
+  if not path then return nil end
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local data = f:read("*a") or ""
+  f:close()
+  return slsconfig.get_fake_appid_text(data, appid)
+end
+
+
 return slsconfig
