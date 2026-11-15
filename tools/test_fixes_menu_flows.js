@@ -510,6 +510,142 @@ async function confirmUnfix() {
     ended(finished(), "fail") && finished().title === S.finishFailTitle
       && finished().text === S.freetpNone && !finished().note, true);
 
+  // ── FreeTP: freetp.org blocking this connection (HTTP 403) ───────────────────
+  const page = "https://freetp.org/po-seti/4202-satisfactory.html";
+  const blockedText = window.__lumenFixesFill(S.freetpSiteBlocked, { status: 403 }) + " "
+    + window.__lumenFixesFill(S.freetpSiteBlockedPage, { page: page });
+  await openMenu({
+    LumenDownloadFreeTPFix: () => ({ success: false, errorCode: "site_blocked", status: 403, pageUrl: page }),
+    LumenListFixArchives: () => ({ success: true, archives: [] }),
+  });
+  tile(S.freetpLabel).click();
+  await settle(60);
+  eq("site_blocked: no archive yet ends failed with the manual path, the status and the page, not retried",
+    ended(finished(), "fail") && finished().text === blockedText
+      && finished().text.indexOf("HTTP 403") !== -1 && finished().text !== S.freetpDownloadErr
+      && calls("LumenDownloadFreeTPFix").length === 1, true);
+
+  await openMenu({
+    LumenDownloadFreeTPFix: () => ({ success: false, errorCode: "site_blocked", status: 403, pageUrl: page }),
+    LumenListFixArchives: () => ({ success: true, archives: [
+      { name: "Satisfactory-Fix.exe", path: "/home/u/Downloads/Satisfactory-Fix.exe", size: 1000, mtime: 1 },
+    ] }),
+  });
+  tile(S.freetpLabel).click();
+  await settle(60);
+  const blockedHint = document.querySelectorAll(".lumen-fx-sub").map((n) => n.textContent).join("|");
+  eq("site_blocked: a downloaded archive is offered in the picker, under the block explanation",
+    document.querySelectorAll(".lumen-fx-arch").length === 1
+      && blockedHint.indexOf(blockedText + " " + S.freetpPickHint) !== -1, true);
+
+  const failText = window.__lumenFixesFreeTPFailText;
+  eq("fail text: site_blocked without a page names only the block",
+    failText(S, { errorCode: "site_blocked", status: 451 }),
+    window.__lumenFixesFill(S.freetpSiteBlocked, { status: 451 }));
+  eq("fail text: other failures keep their own messages",
+    [failText(S, { errorCode: "download_failed", status: 500 }), failText(S, { errorCode: "no_page" }),
+      failText(S, null)].join("|"),
+    [S.freetpDownloadErr, S.freetpNone, S.freetpDownloadErr].join("|"));
+
+  // ── EOS / Epic Fix ──────────────────────────────────────────────────────────
+  const eosArchives = () => ({ success: true, archives: [
+    { name: "Game-EOS-Fix.7z", path: "/home/u/Downloads/Game-EOS-Fix.7z", size: 1000, mtime: 1 },
+  ] });
+  const eosInstall = (answer) => ({ LumenListFixArchives: eosArchives,
+    LumenInstallFixArchive: () => Object.assign({ success: true, added: 2, replaced: 1 }, answer) });
+  const eosPick = async () => {
+    tile(S.eosLabel).click();
+    await settle(60);
+    const shown = { title: (document.querySelector(".lumen-fx-status .lumen-fx-msg") || {}).textContent,
+      hint: (document.querySelector(".lumen-fx-status .lumen-fx-sub") || {}).textContent,
+      rows: document.querySelectorAll(".lumen-fx-arch").length };
+    if (shown.rows) document.querySelectorAll(".lumen-fx-arch")[0].click();
+    await settle(60);
+    return shown;
+  };
+  const counts = window.__lumenFixesFill(S.freetpInstallDetail, { added: 2, replaced: 1 });
+
+  await openMenu(eosInstall({ kind: "eos_emu", eos: { username: "Berk", rewritten: 1, idsReset: true, warnings: [] } }));
+  let picked = await eosPick();
+  eq("eos: no fix in the folder opens the picker with the EOS wording (no leading blank)",
+    picked.title === S.eosPickTitle && picked.hint === S.eosPickHint && picked.rows === 1, true);
+  eq("eos: the picked archive goes to LumenInstallFixArchive for this game",
+    calls("LumenInstallFixArchive").length === 1
+      && calls("LumenInstallFixArchive")[0].args.archivePath === "/home/u/Downloads/Game-EOS-Fix.7z", true);
+  eq("eos: an emulator install names the player name it wrote",
+    ended(finished(), "ok") && finished().title === S.eosInstallTitle
+      && finished().text === counts + " " + window.__lumenFixesFill(S.eosPlayerName, { name: "Berk" })
+      && finished().note === S.freetpInstallNoteReplaced, true);
+
+  await openMenu(eosInstall({ kind: "eos_emu", eos: { username: "Berk", rewritten: 0, idsReset: false,
+    warnings: [{ path: "nepice_settings/NemirtingasEpicEmu.json", reason: "malformed" }] } }));
+  await eosPick();
+  eq("eos: a config left as shipped says so (and the id limit), not a player name",
+    ended(finished(), "ok") && finished().text === counts + " " + S.eosConfigKept
+      && finished().text.indexOf("Berk") === -1, true);
+
+  await openMenu(eosInstall({ kind: "generic" }));
+  await eosPick();
+  eq("eos: an archive without the emulator marker installs as a plain fix, not claimed as EOS",
+    ended(finished(), "ok") && finished().title === S.freetpInstallTitle && finished().text === counts, true);
+
+  await openMenu({ LumenListFixArchives: () => ({ success: true, archives: [] }) });
+  await eosPick();
+  eq("eos: no archive in Downloads ends failed with the manual path",
+    ended(finished(), "fail") && finished().text === S.eosNoArchive
+      && calls("LumenInstallFixArchive").length === 0, true);
+
+  const eosDetected = (eos) => ({ LumenDetectLocalFix: () => ({ success: true, found: true, eos: eos }),
+    LumenListFixArchives: eosArchives });
+  await openMenu(eosDetected({ found: true, broken: false }));
+  eq("eos: a detected emulator fix badges the tile Applied on open",
+    (tile(S.eosLabel).querySelector(".lumen-fx-badge") || {}).textContent, S.appliedBadge);
+  tile(S.eosLabel).click();
+  await settle(60);
+  eq("eos: clicking a detected fix sets launch options only, no picker, no install",
+    ended(finished(), "ok") && finished().title === S.launchSetTitle && finished().text === S.eosLocalDone
+      && calls("LumenListFixArchives").length === 0 && calls("LumenInstallFixArchive").length === 0, true);
+
+  await openMenu(eosDetected({ found: true, broken: true }));
+  eq("eos: settings without their EOSSDK DLL badge the tile Incomplete",
+    (tile(S.eosLabel).querySelector(".lumen-fx-badge") || {}).textContent, S.eosBrokenBadge);
+  tile(S.eosLabel).click();
+  await settle(60);
+  eq("eos: clicking a broken fix ends failed saying what is missing",
+    ended(finished(), "fail") && finished().text === S.eosBroken && calls("LumenInstallFixArchive").length === 0, true);
+
+  await openMenu();
+  eq("eos: no fix evidence leaves the tile unbadged",
+    !!tile(S.eosLabel) && !tile(S.eosLabel).querySelector(".lumen-fx-badge"), true);
+
+  const eosState = window.__lumenFixesEosState;
+  eq("eos state: a Lumen eos record whose extract failed (no files) is not applied",
+    [eosState({ state: "none", recordedKind: "eos_emu" }), eosState({ state: "applied", recordedKind: "eos_emu" }),
+      eosState({ state: "applied", recordedKind: "generic" }), eosState(null)].join("|"),
+    "none|applied|none|none");
+  eq("install view: no kind (older backend answer) keeps the plain fix wording",
+    window.__lumenFixesInstallDoneView(S, { success: true, added: 1, replaced: 0 }).title, S.freetpInstallTitle);
+
+  // fixinstall.revert: a saved emulator config that could not be put back
+  // keeps the record, so pressing Unfix again retries it.
+  await openMenu(Object.assign({}, unfixOk, {
+    LumenRevertFixInstall: () => ({ success: false, errorCode: "restore_failed", reverted: true,
+      removed: 2, replacedCount: 0, needsVerify: false, restored: 1 }) }));
+  await confirmUnfix();
+  eq("unfix: restore_failed says the saved config was not put back, not Restored",
+    (lastModalText() || "").indexOf(S.unfixRestoreFailed) !== -1
+      && (lastModalText() || "").indexOf(S.unfixDone) === -1
+      && (lastModalText() || "").indexOf(S.unfixRevertFailed) === -1, true);
+
+  await openMenu(Object.assign({}, unfixOk, {
+    LumenRevertFixInstall: () => ({ success: true, reverted: true, removed: 2, replacedCount: 0,
+      needsVerify: false, restored: 1 }) }));
+  await confirmUnfix();
+  eq("unfix: put-back configs are counted, with no Verify question for them",
+    (lastModalText() || "").indexOf(window.__lumenFixesFill(S.unfixRestoredNote, { restored: 1 })) !== -1
+      && (lastModalText() || "").indexOf(S.unfixDone) === 0
+      && (lastModalText() || "").indexOf(S.unfixVerifyAsk) === -1, true);
+
   const freetpFix = (extra) => ({ success: true, luaToolsFixes: Object.assign({ authConfigured: true,
     fixes: [{ id: "f1", category: "freetp", title: "FreeTP Online", createdAt: "2026-01-01" }] }, extra) });
   await openMenu({

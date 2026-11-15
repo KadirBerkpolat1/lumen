@@ -40,7 +40,8 @@
   var FX_STYLE_ID = "lumen-fixes-styles";
   var FX_FALLBACK_RECEIPT_KIND = "online_fix_fallback";
   // LumenDownloadFreeTPFix error codes that mean freetp.org has no fix for the
-  // game; every other code is a site or download failure.
+  // game; "site_blocked" means the site refused this connection (HTTP 403/451),
+  // every other code is a site or download failure.
   var FX_FREETP_NOT_FOUND = { invalid_appid: true, no_name: true, no_page: true, no_fix_file: true };
 
   // The icon cluster we tightened (see ensureFixesButton): keep a handle + its
@@ -201,6 +202,42 @@
     return null;
   }
 
+  // PURE: what the FreeTP route says when LumenDownloadFreeTPFix answered dl
+  // without a file. A blocked site cannot be retried past, so it points at the
+  // manual path instead: the fix downloaded in a browser into Downloads, which
+  // the archive picker then installs.
+  function fixesFreeTPFailText(S, dl) {
+    var code = dl && dl.errorCode;
+    if (FX_FREETP_NOT_FOUND[code]) return S.freetpNone;
+    if (code !== "site_blocked") return S.freetpDownloadErr;
+    var text = fixesFill(S.freetpSiteBlocked, { status: dl.status });
+    return dl.pageUrl ? text + " " + fixesFill(S.freetpSiteBlockedPage, { page: dl.pageUrl }) : text;
+  }
+
+  // PURE: the EOS / Epic Fix tile's state from fxProbeLocalFix: "broken" when
+  // the emulator settings lack the EOSSDK DLL beside them, "applied" when an
+  // emulator fix is in place (seen in the folder, or recorded by Lumen with its
+  // files there), else "none".
+  function fixesEosState(probe) {
+    var eos = probe && probe.eos;
+    if (eos && eos.broken === true) return "broken";
+    if ((eos && eos.found === true)
+        || (probe && probe.recordedKind === "eos_emu" && probe.state !== "none")) return "applied";
+    return "none";
+  }
+
+  // PURE: the finished view of a recorded archive install (the
+  // LumenInstallFixArchive answer p). An EOS emulator fix also says which
+  // player name went into its config, or that the config was left as shipped.
+  function fixesInstallDoneView(S, p) {
+    var text = fixesFill(S.freetpInstallDetail, { added: p.added || 0, replaced: p.replaced || 0 });
+    var note = p.replaced ? S.freetpInstallNoteReplaced : S.freetpInstallNote;
+    if (p.kind !== "eos_emu" || !p.eos) return { title: S.freetpInstallTitle, text: text, note: note };
+    var kept = p.eos.warnings && p.eos.warnings.length;
+    return { title: S.eosInstallTitle, note: note,
+      text: text + " " + (kept ? S.eosConfigKept : fixesFill(S.eosPlayerName, { name: p.eos.username })) };
+  }
+
   // PURE: what a click on the "Online Fix · No login" tile does — explain
   // that the game must be installed first, refresh the launch options only
   // (the receipt says the fix files are already in place), or fetch the fix
@@ -321,6 +358,9 @@
     window.__lumenFixesAppliedStates = fixesAppliedStates;
     window.__lumenFixesFallbackReceiptKind = fixesFallbackReceiptKind;
     window.__lumenFixesPickFreeTP = fixesPickFreeTP;
+    window.__lumenFixesFreeTPFailText = fixesFreeTPFailText;
+    window.__lumenFixesEosState = fixesEosState;
+    window.__lumenFixesInstallDoneView = fixesInstallDoneView;
     window.__lumenFixesOnlineTileAction = fixesOnlineTileAction;
     window.__lumenFixesFreshLine = fixesFreshLine;
     window.__lumenFixesFormatBytes = fixesFormatBytes;
@@ -1204,6 +1244,17 @@
     var onlineTile = onlineTileFor(appliedStates.fallbackOnline);
     grid.appendChild(onlineTile);
 
+    // EOS / Epic Fix (fxApplyEOS): an Epic Online Services emulator fix from an
+    // archive the user downloaded, installed recorded so Unfix reverts it.
+    var eosTileFor = function (state) {
+      return fxTile(S.eosLabel, isNative ? S.nativeWarnShort : S.eosDesc,
+        { iconKey: "key", warn: isNative, applied: state === "applied",
+          badge: { applied: S.appliedBadge, broken: S.eosBrokenBadge }[state] || null },
+        function () { fxApplyEOS(appid, ctx, win); });
+    };
+    var eosTile = eosTileFor("none");
+    grid.appendChild(eosTile);
+
     // Freshness subtitles: which source stamps the newer fix (fixfresh.lua —
     // online-fix.me's torrent date vs freetp.org's page-update marker). Pure
     // decoration: a failure draws nothing, the backend caches per appid, and
@@ -1247,6 +1298,7 @@
         // no files (probe.state "none") — that must re-run the install, not
         // the launch-options shortcut. Unfix clears such a record too.
         if (probe.recorded === "onlinefix" && probe.state !== "none") onlineTile = swap(onlineTile, onlineTileFor(true));
+        if (fixesEosState(probe) !== "none") eosTile = swap(eosTile, eosTileFor(fixesEosState(probe)));
         if (probe.state !== "applied" && probe.state !== "needsOptions") return;
         freetpTile = swap(freetpTile, freetpTileFor(probe.state));
       }).catch(function () {});
@@ -1308,8 +1360,8 @@
   }
 
   // A flow that fails before showing progress still ends in the finished view.
-  function fxShowFailure(win, text) {
-    fxShowProgress(win, fxStrings().freetpFixLabel);
+  function fxShowFailure(win, text, label) {
+    fxShowProgress(win, label || fxStrings().freetpFixLabel);
     fxFailProgress(win, text);
   }
 
@@ -1458,7 +1510,7 @@
         return fxDownloadFreeTP(appid, gameName, win, onPending).then(function (dl) {
           if (dl && dl.pending) return function () {};
           if (!(dl && dl.success && dl.path)) {
-            return pickerOr(FX_FREETP_NOT_FOUND[dl && dl.errorCode] ? S.freetpNone : S.freetpDownloadErr);
+            return pickerOr(fixesFreeTPFailText(S, dl));
           }
           return function () {
             fxInstallArchive(win, appid, ctx, {
@@ -1494,30 +1546,65 @@
     });
   }
 
-  // Resolves { state, recorded }: state (fixesLocalFixState) of a fix already
-  // in the game folder, gated on real fix evidence (the override derivation
-  // alone also fires on game-shipped DirectX redist DLLs, D3D12Core.dll), and
-  // recorded, the source ("freetp" | "onlinefix" | "archive") of Lumen's own
-  // install record.
+  // EOS / Epic Fix — an emulator fix already in the game folder gets its launch
+  // options; a broken one says what is missing; otherwise the user picks the
+  // fix archive they downloaded (there is no download source to fetch it from).
+  function fxApplyEOS(appid, ctx, win) {
+    var S = fxStrings();
+    if (!ctx.installPath) { fxAlert(S.notInstalled); return; }
+    if (!ctx.runsUnderProton) { fxAlert(S.nativeWarn); return; }
+    var done = fxBusy(win, S.eosChecking);
+    fxProbeLocalFix(appid, ctx).then(function (probe) {
+      var state = fixesEosState(probe);
+      if (state === "broken") return function () { fxShowFailure(win, S.eosBroken, S.eosLabel); };
+      if (state === "applied") {
+        return function () {
+          fxApplyLaunchOnly(appid, ctx, win, S.launchOnlyBusy, { title: S.launchSetTitle, text: S.eosLocalDone });
+        };
+      }
+      return call("LumenListFixArchives", { contentScriptQuery: "" }).then(fxParse).then(function (list) {
+        var archives = list && list.success && list.archives;
+        if (!(archives && archives.length)) return function () { fxShowFailure(win, S.eosNoArchive, S.eosLabel); };
+        return function () {
+          fxShowArchivePicker(win, appid, ctx, archives, "", { title: S.eosPickTitle, hint: S.eosPickHint });
+        };
+      });
+    }).then(function (show) {
+      done();
+      if (win.isConnected) show();
+    }).catch(function () { done(); fxShowFailure(win, S.applyErr, S.eosLabel); });
+  }
+
+  // Resolves { state, recorded, eos, recordedKind }: state (fixesLocalFixState)
+  // of a fix already in the game folder, gated on real fix evidence (the
+  // override derivation alone also fires on game-shipped DirectX redist DLLs,
+  // D3D12Core.dll), recorded, the source ("freetp" | "onlinefix" | "archive")
+  // of Lumen's own install record, recordedKind that record's kind
+  // ("eos_emu" | "generic"), and eos the emulator evidence ({ found, broken }).
   function fxProbeLocalFix(appid, ctx) {
     return call("LumenDetectLocalFix", {
       appid: appid, installPath: ctx.installPath || "", contentScriptQuery: "",
     }).then(fxParse).then(function (detected) {
       var recorded = detected && detected.recorded;
-      if (!(detected && detected.success && detected.found)) return { state: "none", recorded: recorded };
+      var eos = detected && detected.eos, recordedKind = detected && detected.recordedKind;
+      if (!(detected && detected.success && detected.found)) {
+        return { state: "none", recorded: recorded, recordedKind: recordedKind };
+      }
       return call("GetFixLaunchOptions", {
         appid: appid, compatToolName: "", currentLaunchOptions: "",
         installPath: ctx.installPath, contentScriptQuery: "",
       }).then(fxParse).then(function (launch) {
-        return { state: fixesLocalFixState(detected, launch), recorded: recorded };
+        return { state: fixesLocalFixState(detected, launch), recorded: recorded,
+          eos: eos, recordedKind: recordedKind };
       });
     });
   }
 
   // The archive picker: a fix archive the user downloaded (from FreeTP or any
   // source), installed through fixinstall so Unfix can revert it. why is what
-  // the freetp.org route reported before falling back to this list.
-  function fxShowArchivePicker(win, appid, ctx, archives, why) {
+  // the freetp.org route reported before falling back to this list; copy
+  // ({ title, hint }) replaces the FreeTP wording.
+  function fxShowArchivePicker(win, appid, ctx, archives, why, copy) {
     var S = fxStrings();
     var body = win.querySelector(".lumen-fx-body");
     if (!body) return;
@@ -1528,10 +1615,10 @@
     var title = document.createElement("div");
     title.className = "lumen-fx-msg";
     title.style.fontWeight = "600";
-    title.textContent = S.freetpPickTitle;
+    title.textContent = (copy && copy.title) || S.freetpPickTitle;
     var hint = document.createElement("div");
     hint.className = "lumen-fx-sub";
-    hint.textContent = why + " " + S.freetpPickHint;
+    hint.textContent = (why ? why + " " : "") + ((copy && copy.hint) || S.freetpPickHint);
     wrap.appendChild(title);
     wrap.appendChild(hint);
     archives.forEach(function (a) {
@@ -1637,11 +1724,7 @@
           no_extractor_inno: S.installNeedsInno }[p && p.errorCode] || S.freetpInstallErr);
         return;
       }
-      fxApplyLaunchOnly(appid, ctx, win, S.freetpInstallBusy, {
-        title: S.freetpInstallTitle,
-        text: fixesFill(S.freetpInstallDetail, { added: p.added || 0, replaced: p.replaced || 0 }),
-        note: p.replaced ? S.freetpInstallNoteReplaced : S.freetpInstallNote,
-      });
+      fxApplyLaunchOnly(appid, ctx, win, S.freetpInstallBusy, fixesInstallDoneView(S, p));
     }).catch(function () { done(); fxShowFailure(win, S.freetpInstallErr); });
   }
 
@@ -1868,12 +1951,14 @@
               // pressing Unfix again would not help.
               if (!(r && r.success !== false)) {
                 var unreadable = r && (r.errorCode === "record_invalid" || r.errorCode === "record_unreadable");
-                after([optionsNote, unreadable ? S.unfixRecordUnreadable : S.unfixRevertFailed], true);
+                after([optionsNote, unreadable ? S.unfixRecordUnreadable
+                  : r && r.errorCode === "restore_failed" ? S.unfixRestoreFailed : S.unfixRevertFailed], true);
                 return;
               }
               if (!r.reverted) { after([optionsNote], leftover); return; }
+              var restoredNote = r.restored ? fixesFill(S.unfixRestoredNote, { restored: r.restored }) : "";
               if (!r.needsVerify) {
-                after([optionsNote, S.unfixRemovedNote.replace("{removed}", r.removed || 0)], leftover);
+                after([optionsNote, S.unfixRemovedNote.replace("{removed}", r.removed || 0), restoredNote], leftover);
                 return;
               }
               // Steam's verify re-downloads changed files: never a surprise.
@@ -1886,10 +1971,10 @@
                   call("__lumenValidateApp", { appid: Number(appid) })
                     .then(fixesRelayOk, function () { return false; })
                     .then(function (ok) {
-                      after([optionsNote, ok ? S.unfixVerifyStarted : manual], leftover || !ok);
+                      after([optionsNote, restoredNote, ok ? S.unfixVerifyStarted : manual], leftover || !ok);
                     });
                 },
-                function () { after([optionsNote, manual], true); },
+                function () { after([optionsNote, restoredNote, manual], true); },
                 S.verifyLabel);
             })
             .catch(function () { after([optionsNote, S.unfixRevertFailed], true); });
