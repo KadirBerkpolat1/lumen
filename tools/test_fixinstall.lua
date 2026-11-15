@@ -267,6 +267,34 @@ do
     fi.detect_local("/nope", { fs = { list = function() error("x") end } }).found == false
       and fi.detect_local("", { fs = fake_fs({ "winmm.dll" }) }).found == false
       and fi.detect_local("/g", {}).found == false)
+
+  -- EOS emulator: evidence is its settings, never the EOSSDK DLL alone.
+  local W64 = "/g/Game/Binaries/Win64"
+  local eos_ok = fi.detect_local("/g", { fs = tree_fs({
+    ["/g"] = { d("Game") }, ["/g/Game"] = { d("Binaries") }, ["/g/Game/Binaries"] = { d("Win64") },
+    [W64] = { f("Game.exe"), f("EOSSDK-Win64-Shipping.dll"), d("nepice_settings") },
+  }) })
+  check("detect: EOS emulator settings beside an EOSSDK DLL -> found, not broken (at the scan depth)",
+    eos_ok.found == true and eos_ok.eos ~= nil and eos_ok.eos.found == true
+      and eos_ok.eos.broken == false and eos_ok.broken == false)
+  local eos_cfg = fi.detect_local("/g", { fs = tree_fs({
+    ["/g"] = { d("Win64") },
+    ["/g/Win64"] = { f("EOSSDK-Win64-Shipping.dll"), d("nepice_settings") },
+    ["/g/Win64/nepice_settings"] = { f("NemirtingasEpicEmu.json") },
+  }) })
+  check("detect: the emulator config file itself is evidence too",
+    eos_cfg.found == true and eos_cfg.eos.broken == false)
+  local eos_broken = fi.detect_local("/g", { fs = tree_fs({
+    ["/g"] = { f("Game.exe"), d("nepice_settings") },
+    ["/g/nepice_settings"] = { f("NemirtingasEpicEmu.json") },
+  }) })
+  check("detect: emulator settings without an EOSSDK DLL beside them -> eos broken",
+    eos_broken.found == true and eos_broken.eos.broken == true)
+  check("detect: a genuine EOSSDK DLL and the EOS installer are not a fix",
+    fi.detect_local("/g", { fs = tree_fs({
+      ["/g"] = { f("EOSSDK-Win64-Shipping.dll"), d("EpicOnlineServices") },
+      ["/g/EpicOnlineServices"] = { f("EpicOnlineServicesInstaller.exe"), f("EOSSDK-Win32-Shipping.dll") },
+    }) }).found == false)
 end
 
 -- ── register (RPC shape, injected deps) ──────────────────────────────────────
@@ -653,6 +681,136 @@ else
   check("e2e: a tampered record never deletes outside the game folder, and fails the revert",
     rv_tampered.success == false and rv_tampered.errorCode == "record_invalid"
       and rv_tampered.reverted == false and read_file(tmp .. "/outside.txt") == "KEEP")
+
+  os.execute("rm -rf -- " .. q(tmp))
+end
+
+-- ── EOS emulator fix, end to end (fixtures; skips without a 7-zip binary) ───
+-- Proves classify / back up / extract / overlay / config rewrite / revert on
+-- real archives. It cannot prove an in-game EOS handshake.
+if bin then
+  local tmp = "/tmp/lumen_fixinstall_eos"
+  local game, dl, store = tmp .. "/game", tmp .. "/Downloads", tmp .. "/store"
+  local W64 = "FactoryGame/Binaries/Win64"
+  local SDK, CFG = W64 .. "/EOSSDK-Win64-Shipping.dll", W64 .. "/nepice_settings/NemirtingasEpicEmu.json"
+  local APPID = "0123456789abcdef0123456789abcdef"
+  local SHIPPED = '{\n    "appid": "' .. APPID .. '",\n    "epicid": "156abc156f1c5487f91c",\n'
+    .. '    "productuserid": "0x8d7e6f5a4b3c2d1e",\n    "savepath": "saves/emu",\n'
+    .. '    "username": "FreeTP.Org"\n}\n'
+  local ORIGINAL_CFG = '{ "appid": "' .. APPID .. '", "username": "Mine" }\n'
+  os.execute("rm -rf -- " .. q(tmp) .. " && mkdir -p -- " .. q(game .. "/" .. W64 .. "/nepice_settings")
+    .. " " .. q(dl) .. " " .. q(store) .. " " .. q(tmp .. "/.steam/steam/config"))
+  write_file(tmp .. "/.steam/steam/config/loginusers.vdf", '"users"\n{\n\t"76561198000000002"\n\t{\n'
+    .. '\t\t"AccountName"\t\t"berk_login"\n\t\t"PersonaName"\t\t"Berk"\n\t\t"MostRecent"\t\t"1"\n\t}\n}\n')
+  write_file(game .. "/" .. SDK, "GENUINE-SDK")
+  local function reset_config(text)
+    if not text then return os.remove(game .. "/" .. CFG) end
+    os.execute("mkdir -p -- " .. q(game .. "/" .. W64 .. "/nepice_settings"))
+    write_file(game .. "/" .. CFG, text)
+  end
+  local function archive(name, files)
+    local d = tmp .. "/src_" .. name
+    os.execute("rm -rf -- " .. q(d))
+    for p, body in pairs(files) do
+      os.execute("mkdir -p -- " .. q((d .. "/" .. p):match("^(.*)/[^/]+$")))
+      write_file(d .. "/" .. p, body)
+    end
+    local out = dl .. "/" .. name
+    os.execute("cd " .. q(d) .. " && " .. q(bin) .. " a " .. q(out) .. " . >/dev/null 2>&1")
+    return out
+  end
+  local deps = {
+    home = tmp,
+    resolve_install = function() return { success = true, installPath = game } end,
+    store_root = function() return store end,
+    bin = bin,
+  }
+  local rec = function()
+    local raw = read_file(store .. "/4312190/manifest.json")
+    return raw and json.decode(raw) or nil
+  end
+  local backup = store .. "/4312190/eos_backup/" .. CFG
+  local emu = archive("emu.7z", { [SDK] = "EMU-SDK", [CFG] = SHIPPED })
+
+  -- The game already holds its own emulator config: backed up, then rewritten.
+  reset_config(ORIGINAL_CFG)
+  local r = fi.install(4312190, emu, game, deps)
+  check("eos e2e: install succeeds as eos_emu with the Steam PersonaName",
+    r.success == true and r.kind == "eos_emu" and r.eos and r.eos.username == "Berk"
+      and r.eos.rewritten == 1 and r.eos.idsReset == true and #r.eos.warnings == 0)
+  check("eos e2e: the emulator DLL is overlaid on the genuine one", read_file(game .. "/" .. SDK) == "EMU-SDK")
+  local cfg_text = read_file(game .. "/" .. CFG) or ""
+  local cfg = json.decode(cfg_text)
+  check("eos e2e: config gets the player's name, loses the shipped ids, keeps appid and every other byte",
+    cfg.username == "Berk" and cfg.epicid == nil and cfg.productuserid == nil and cfg.appid == APPID
+      and cfg_text == '{\n    "appid": "' .. APPID .. '",\n    "savepath": "saves/emu",\n'
+        .. '    "username": "Berk"\n}\n')
+  local m = rec()
+  local replaced = {}
+  for _, p in ipairs(m.replaced) do replaced[p] = true end
+  check("eos e2e: the record names the kind, the configs and the backed-up original",
+    m.kind == "eos_emu" and m.eos.configs[1] == CFG and m.eos.backups[1] == CFG
+      and replaced[CFG] and replaced[SDK] and read_file(backup) == ORIGINAL_CFG)
+  local det = fi.detect_local(game, {})
+  check("eos e2e: detect_local sees the installed emulator fix",
+    det.found == true and det.eos and det.eos.found == true and det.eos.broken == false)
+
+  -- A second install of the same fix keeps the ORIGINAL backup, not fix content.
+  local r2 = fi.install(4312190, emu, game, deps)
+  check("eos e2e: re-install keeps the first backup",
+    r2.success == true and read_file(backup) == ORIGINAL_CFG and rec().eos.backups[1] == CFG)
+
+  -- A missing backup fails the revert and keeps the record for another try.
+  os.rename(backup, backup .. ".away")
+  local rv_fail = fi.revert(4312190, deps)
+  check("eos e2e: a revert that cannot restore the config fails and keeps the record",
+    rv_fail.success == false and rv_fail.errorCode == "restore_failed" and rec() ~= nil)
+  os.rename(backup .. ".away", backup)
+  local rv = fi.revert(4312190, deps)
+  check("eos e2e: revert restores the original config byte for byte, Verify only for the DLL",
+    rv.success == true and rv.reverted == true and rv.restored == 1 and rv.replacedCount == 1
+      and rv.needsVerify == true and read_file(game .. "/" .. CFG) == ORIGINAL_CFG
+      and read_file(game .. "/.slssteam_fix_dlls") == nil and rec() == nil)
+
+  -- No config in the game: the shipped one is added, so revert just removes it.
+  reset_config(nil)
+  write_file(game .. "/" .. SDK, "GENUINE-SDK")
+  local added = fi.install(4312190, emu, game, deps)
+  check("eos e2e: a config the game did not have is added, with no backup",
+    added.success == true and #rec().eos.backups == 0 and read_file(backup) == nil)
+  local rv_added = fi.revert(4312190, deps)
+  check("eos e2e: revert removes the added config and its settings folder",
+    rv_added.success == true and rv_added.restored == 0 and read_file(game .. "/" .. CFG) == nil
+      and os.execute("test -d " .. q(game .. "/" .. W64 .. "/nepice_settings")) ~= true
+      and os.execute("test -d " .. q(game .. "/" .. W64)) == true)
+
+  -- A malformed shipped config is installed as shipped, with a warning.
+  local BAD = '{"appid": "' .. APPID .. '", "epicid": '
+  local bad = fi.install(4312190, archive("bad.7z", { [SDK] = "EMU-SDK", [CFG] = BAD }), game, deps)
+  check("eos e2e: a malformed config is left untouched and reported, the install still lands",
+    bad.success == true and bad.eos.rewritten == 0 and bad.eos.warnings[1]
+      and bad.eos.warnings[1].path == CFG and bad.eos.warnings[1].reason == "malformed"
+      and read_file(game .. "/" .. CFG) == BAD)
+  fi.revert(4312190, deps)
+
+  -- The record is written before extraction: a failed extract still reverts.
+  reset_config(ORIGINAL_CFG)
+  local broke = fi.install(4312190, emu, game, setmetatable({ execute = function() return false end },
+    { __index = deps }))
+  check("eos e2e: a failed extract leaves an eos record with the backup",
+    broke.success == false and broke.errorCode == "extract_failed"
+      and rec() and rec().kind == "eos_emu" and rec().eos.backups[1] == CFG
+      and read_file(backup) == ORIGINAL_CFG)
+  local rv_broke = fi.revert(4312190, deps)
+  check("eos e2e: ...which Unfix reverts", rv_broke.success == true and rv_broke.reverted == true
+    and read_file(game .. "/" .. CFG) == ORIGINAL_CFG and rec() == nil)
+
+  -- A genuine EOSSDK DLL alone is an ordinary archive.
+  local plain = fi.install(4312190, archive("plain.7z", { [SDK] = "OTHER-SDK" }), game, deps)
+  check("eos e2e: an archive with only an EOSSDK DLL is generic, no eos step",
+    plain.success == true and plain.kind == "generic" and plain.eos == nil
+      and rec().eos == nil and read_file(game .. "/" .. CFG) == ORIGINAL_CFG)
+  fi.revert(4312190, deps)
 
   os.execute("rm -rf -- " .. q(tmp))
 end

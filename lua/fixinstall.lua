@@ -27,6 +27,11 @@ fixinstall.MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 fixinstall.ARCHIVE_PASSWORD = "online-fix.me"
 
 local json = require("json")
+local eosfix = require("eosfix")
+
+-- Under a record's folder: the game's own EOS emulator configs an install
+-- overwrote, restored on revert.
+local EOS_BACKUP_DIR = "eos_backup"
 
 -- Single-quote a value for the shell ('' escaping), like the rest of Lumen.
 local function shq(value)
@@ -337,9 +342,11 @@ fixinstall.FIX_SCAN_DEPTH = 4
 -- Ceiling on entries visited; the scan runs on the single-threaded RPC loop.
 fixinstall.FIX_SCAN_MAX_ENTRIES = 20000
 
--- scan_fix_files(root, fs_mod) -> { { name, path } } for every file under root
--- within FIX_SCAN_DEPTH, breadth-first, capped at FIX_SCAN_MAX_ENTRIES.
--- Unreadable directories are skipped. fs_mod follows Lumen's fs.list contract.
+-- scan_fix_files(root, fs_mod) -> { { name, path, is_directory? } } for every
+-- file under root within FIX_SCAN_DEPTH, breadth-first, capped at
+-- FIX_SCAN_MAX_ENTRIES, plus the EOS emulator's settings folders (found one
+-- level deeper than the files they hold). Unreadable directories are skipped.
+-- fs_mod follows Lumen's fs.list contract.
 function fixinstall.scan_fix_files(root, fs_mod)
   local out, seen = {}, 0
   if type(root) ~= "string" or root == "" or type(fs_mod) ~= "table"
@@ -358,6 +365,9 @@ function fixinstall.scan_fix_files(root, fs_mod)
         local path = tostring(e.path or "")
         if path == "" and e.name then path = item.dir .. "/" .. tostring(e.name) end
         if e.is_directory then
+          if eosfix.is_settings_dir(e.name) then
+            out[#out + 1] = { name = tostring(e.name), path = path, is_directory = true }
+          end
           if item.depth + 1 < fixinstall.FIX_SCAN_DEPTH then
             queue[#queue + 1] = { dir = path, depth = item.depth + 1 }
           end
@@ -482,14 +492,16 @@ function fixinstall.sync_fake_appid(appid, install_dir, deps)
   return { success = ok == true, fakeAppId = fake, status = tostring(status or "") }
 end
 
--- detect_local(install_path, deps) -> { found, broken, fakeAppId }: is a REAL
--- fix installed in this game folder? A fix announces itself with a loader list
--- file (winmm.txt / dlllist.txt), a fix config (onlinefix.ini /
--- steamfix.ini), or a fix payload DLL (onlinefix*/steamfix*). A proxy DLL
+-- detect_local(install_path, deps) -> { found, broken, fakeAppId, eos? }: is a
+-- REAL fix installed in this game folder? A fix announces itself with a loader
+-- list file (winmm.txt / dlllist.txt), a fix config (onlinefix.ini /
+-- steamfix.ini), a fix payload DLL (onlinefix*/steamfix*), or the EOS
+-- emulator's settings (nepice_settings/NemirtingasEpicEmu.json; eos = { found,
+-- broken }, broken when no EOSSDK DLL sits beside them). A proxy DLL
 -- (winmm/winhttp/version) alone is not enough: mod loaders such as BepInEx
 -- ship one too. Only fix-specific names count: a game-shipped DirectX redist
--- (D3D12/D3D12Core.dll) must NEVER read as "a fix is installed". deps.fs is
--- injectable for tests.
+-- (D3D12/D3D12Core.dll) or a genuine EOSSDK DLL must NEVER read as "a fix is
+-- installed". deps.fs is injectable for tests.
 function fixinstall.detect_local(install_path, deps)
   deps = deps or {}
   local res = { found = false, broken = false }
@@ -503,16 +515,33 @@ function fixinstall.detect_local(install_path, deps)
   local files = fixinstall.scan_fix_files(install_path, fs_mod)
   local proxies = { winmm = true, winhttp = true, version = true }
   local proxy, loader, ini_path = false, false, nil
+  -- EOS: folders holding an EOSSDK DLL, and folders the emulator settings sit in.
+  local sdk_dirs, eos_hosts = {}, {}
+  local function dir_of(p) return p:match("^(.*)/[^/]+$") or "" end
   for _, e in ipairs(files) do
     local low = tostring(e.name or ""):lower()
     local stem = low:match("^(.-)%.dll$")
-    if stem and proxies[stem] then proxy = true end
-    if low == "winmm.txt" or low == "dlllist.txt" then loader = true end
-    if low == "onlinefix.ini" or low == "steamfix.ini"
-        or (stem and (stem:match("^onlinefix%d*$") or stem:match("^steamfix%d*$"))) then
-      res.found = true
-      if low == "onlinefix.ini" or low == "steamfix.ini" then ini_path = e.path end
+    if e.is_directory then
+      eos_hosts[dir_of(e.path)] = true
+    else
+      if stem and proxies[stem] then proxy = true end
+      if low == "winmm.txt" or low == "dlllist.txt" then loader = true end
+      if low == "onlinefix.ini" or low == "steamfix.ini"
+          or (stem and (stem:match("^onlinefix%d*$") or stem:match("^steamfix%d*$"))) then
+        res.found = true
+        if low == "onlinefix.ini" or low == "steamfix.ini" then ini_path = e.path end
+      end
+      if eosfix.is_sdk_dll(low) then sdk_dirs[dir_of(e.path)] = true end
+      if eosfix.is_config_path(e.path) then eos_hosts[dir_of(dir_of(e.path))] = true end
     end
+  end
+  if next(eos_hosts) then
+    local broken = false
+    for host in pairs(eos_hosts) do
+      if not sdk_dirs[host] then broken = true end
+    end
+    res.found = true
+    res.eos = { found = true, broken = broken }
   end
   res.found = res.found or loader
   -- A loader list without its proxy DLL cannot load (LuaTools' UnFixGame
@@ -630,6 +659,52 @@ local function write_manifest(root, data, open)
     return false
   end
   return true
+end
+
+-- write_file_atomic(path, data) -> true once path holds data in full; a failed
+-- write leaves the previous file whole.
+local function write_file_atomic(path, data)
+  local tmp = path .. ".lumen.tmp"
+  local f = io.open(tmp, "wb")
+  if not f then return false end
+  local written = f:write(data)
+  local closed = f:close()
+  if not (written and closed and os.rename(tmp, path)) then
+    os.remove(tmp)
+    return false
+  end
+  return true
+end
+
+-- rewrite_eos_configs(install_dir, configs, home) -> { username, rewritten,
+-- idsReset, warnings }: each extracted EOS emulator config gets this player's
+-- identity (eosfix.rewrite_config). Fail safe: a config that cannot be read,
+-- parsed or rewritten stays exactly as the fix shipped it and is listed in
+-- warnings ({ path, reason }).
+local function rewrite_eos_configs(install_dir, configs, home)
+  local username = eosfix.persona_name({ home = home }) or eosfix.DEFAULT_USERNAME
+  local out = { username = username, rewritten = 0, idsReset = false, warnings = {} }
+  for _, p in ipairs(configs) do
+    local path = install_dir .. "/" .. p
+    local text = read_text_file(path)
+    local new, info
+    if text then
+      new, info = eosfix.rewrite_config(text, username)
+    else
+      info = "unreadable"
+    end
+    if not new then
+      out.warnings[#out.warnings + 1] = { path = p, reason = info }
+    elseif new ~= text then
+      if write_file_atomic(path, new) then
+        out.rewritten = out.rewritten + 1
+        out.idsReset = out.idsReset or info.idsReset
+      else
+        out.warnings[#out.warnings + 1] = { path = p, reason = "write_failed" }
+      end
+    end
+  end
+  return out
 end
 
 local function install_archive(appid, archive_path, install_path_hint, deps)
@@ -752,6 +827,35 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
     end
   end
 
+  -- An EOS emulator fix gets its configs rewritten after extraction. A config
+  -- the game folder already held is not a Steam file, so Verify cannot bring
+  -- it back: it is copied into the record's folder BEFORE anything lands and
+  -- restored on revert. Backups an earlier install made hold the originals
+  -- and are kept, like its replaced list.
+  local kind = eosfix.classify(entries)
+  local eos_configs = kind == eosfix.KIND and eosfix.config_paths(entries) or {}
+  local backups, backed_up = {}, {}
+  local prev_eos = prev and type(prev.eos) == "table" and prev.eos or {}
+  for _, p in ipairs(type(prev_eos.backups) == "table" and prev_eos.backups or {}) do
+    if type(p) == "string" and not backed_up[p]
+        and exists(root .. "/" .. EOS_BACKUP_DIR .. "/" .. p) then
+      backups[#backups + 1] = p
+      backed_up[p] = true
+    end
+  end
+  for _, p in ipairs(eos_configs) do
+    if replaced_set[p] and not backed_up[p] then
+      local saved = root .. "/" .. EOS_BACKUP_DIR .. "/" .. p
+      if os.execute("mkdir -p -- " .. shq(saved:match("^(.*)/[^/]+$")) .. " && cp -f -- "
+          .. shq(install_dir .. "/" .. p) .. " " .. shq(saved) .. " 2>/dev/null") ~= true then
+        res.errorCode = "backup_failed"
+        return res
+      end
+      backups[#backups + 1] = p
+      backed_up[p] = true
+    end
+  end
+
   local lumen = home .. "/.local/share/Lumen/"
   local source = archive_path:find(lumen .. "freetp_dl/", 1, true) == 1 and "freetp"
     or archive_path:find(lumen .. "onlinefix_dl/", 1, true) == 1 and "onlinefix"
@@ -761,9 +865,11 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
     installedAt = os.time(),
     archive = archive_path:match("([^/]+)$") or archive_path,
     source = source,
+    kind = kind,
     installPath = install_dir,
     added = added,
     replaced = replaced,
+    eos = (#eos_configs > 0 or #backups > 0) and { configs = eos_configs, backups = backups } or nil,
   }), deps.open_file or io.open) then
     res.errorCode = "record_failed"
     return res
@@ -796,6 +902,7 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
       f:close()
     end
   end
+  if #eos_configs > 0 then res.eos = rewrite_eos_configs(install_dir, eos_configs, home) end
 
   -- A Windows online fix swaps the AppID at the client layer itself; the same
   -- swap has to happen in SLSsteam, or this side reports the real AppID while
@@ -822,6 +929,7 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
   end
 
   res.success = true
+  res.kind = kind
   res.added = #added
   res.replaced = #replaced
   return res
@@ -877,7 +985,33 @@ function fixinstall.revert(appid, deps)
     return res
   end
   res.removed = removed
-  res.replacedCount = #(type(m.replaced) == "table" and m.replaced or {})
+  -- Configs an EOS fix overwrote come back from the record's backups (Verify
+  -- cannot restore them). A failed restore keeps the record, so Unfix can be
+  -- pressed again.
+  local backup_list = {}
+  for _, p in ipairs(type(m.eos) == "table" and type(m.eos.backups) == "table" and m.eos.backups or {}) do
+    backup_list[#backup_list + 1] = { path = tostring(p) }
+  end
+  local restore = fixinstall.safe_entries(backup_list)
+  if not restore then
+    res.success = false
+    res.errorCode = "record_invalid"
+    return res
+  end
+  local restored = {}
+  for _, e in ipairs(restore) do
+    if os.execute("cp -f -- " .. shq(root .. "/" .. EOS_BACKUP_DIR .. "/" .. e.path) .. " "
+        .. shq(m.installPath .. "/" .. e.path) .. " 2>/dev/null") ~= true then
+      res.success = false
+      res.errorCode = "restore_failed"
+      return res
+    end
+    restored[e.path] = true
+  end
+  res.restored = #restore
+  for _, p in ipairs(type(m.replaced) == "table" and m.replaced or {}) do
+    if not restored[p] then res.replacedCount = res.replacedCount + 1 end
+  end
   res.needsVerify = res.replacedCount > 0
   -- Drop only the swap this record installed: a mapping the user set by hand (or
   -- the SpaceFix tile) survives, because the recorded id must still match.
@@ -1034,8 +1168,10 @@ function fixinstall.register(registry, deps)
     if res.found and type(det) == "table" and det.fakeAppId then
       res.fakeAppId = det.fakeAppId
     end
+    if res.found and type(det) == "table" and det.eos then res.eos = det.eos end
     local m = read_manifest((deps and deps.store_root or store_root)() .. "/" .. appid)
     res.recorded = m and m.source or nil
+    res.recordedKind = m and m.kind or nil
     return json.encode(res)
   end
   registry.LumenListFixArchives = function()
