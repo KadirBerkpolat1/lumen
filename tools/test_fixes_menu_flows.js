@@ -510,6 +510,43 @@ async function confirmUnfix() {
     ended(finished(), "fail") && finished().title === S.finishFailTitle
       && finished().text === S.freetpNone && !finished().note, true);
 
+  // ── FreeTP: freetp.org blocking this connection (HTTP 403) ───────────────────
+  const page = "https://freetp.org/po-seti/4202-satisfactory.html";
+  const blockedText = window.__lumenFixesFill(S.freetpSiteBlocked, { status: 403 }) + " "
+    + window.__lumenFixesFill(S.freetpSiteBlockedPage, { page: page });
+  await openMenu({
+    LumenDownloadFreeTPFix: () => ({ success: false, errorCode: "site_blocked", status: 403, pageUrl: page }),
+    LumenListFixArchives: () => ({ success: true, archives: [] }),
+  });
+  tile(S.freetpLabel).click();
+  await settle(60);
+  eq("site_blocked: no archive yet ends failed with the manual path, the status and the page, not retried",
+    ended(finished(), "fail") && finished().text === blockedText
+      && finished().text.indexOf("HTTP 403") !== -1 && finished().text !== S.freetpDownloadErr
+      && calls("LumenDownloadFreeTPFix").length === 1, true);
+
+  await openMenu({
+    LumenDownloadFreeTPFix: () => ({ success: false, errorCode: "site_blocked", status: 403, pageUrl: page }),
+    LumenListFixArchives: () => ({ success: true, archives: [
+      { name: "Satisfactory-Fix.exe", path: "/home/u/Downloads/Satisfactory-Fix.exe", size: 1000, mtime: 1 },
+    ] }),
+  });
+  tile(S.freetpLabel).click();
+  await settle(60);
+  const blockedHint = document.querySelectorAll(".lumen-fx-sub").map((n) => n.textContent).join("|");
+  eq("site_blocked: a downloaded archive is offered in the picker, under the block explanation",
+    document.querySelectorAll(".lumen-fx-arch").length === 1
+      && blockedHint.indexOf(blockedText + " " + S.freetpPickHint) !== -1, true);
+
+  const failText = window.__lumenFixesFreeTPFailText;
+  eq("fail text: site_blocked without a page names only the block",
+    failText(S, { errorCode: "site_blocked", status: 451 }),
+    window.__lumenFixesFill(S.freetpSiteBlocked, { status: 451 }));
+  eq("fail text: other failures keep their own messages",
+    [failText(S, { errorCode: "download_failed", status: 500 }), failText(S, { errorCode: "no_page" }),
+      failText(S, null)].join("|"),
+    [S.freetpDownloadErr, S.freetpNone, S.freetpDownloadErr].join("|"));
+
   const freetpFix = (extra) => ({ success: true, luaToolsFixes: Object.assign({ authConfigured: true,
     fixes: [{ id: "f1", category: "freetp", title: "FreeTP Online", createdAt: "2026-01-01" }] }, extra) });
   await openMenu({

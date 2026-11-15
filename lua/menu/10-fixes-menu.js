@@ -40,7 +40,8 @@
   var FX_STYLE_ID = "lumen-fixes-styles";
   var FX_FALLBACK_RECEIPT_KIND = "online_fix_fallback";
   // LumenDownloadFreeTPFix error codes that mean freetp.org has no fix for the
-  // game; every other code is a site or download failure.
+  // game; "site_blocked" means the site refused this connection (HTTP 403/451),
+  // every other code is a site or download failure.
   var FX_FREETP_NOT_FOUND = { invalid_appid: true, no_name: true, no_page: true, no_fix_file: true };
 
   // The icon cluster we tightened (see ensureFixesButton): keep a handle + its
@@ -201,6 +202,18 @@
     return null;
   }
 
+  // PURE: what the FreeTP route says when LumenDownloadFreeTPFix answered dl
+  // without a file. A blocked site cannot be retried past, so it points at the
+  // manual path instead: the fix downloaded in a browser into Downloads, which
+  // the archive picker then installs.
+  function fixesFreeTPFailText(S, dl) {
+    var code = dl && dl.errorCode;
+    if (FX_FREETP_NOT_FOUND[code]) return S.freetpNone;
+    if (code !== "site_blocked") return S.freetpDownloadErr;
+    var text = fixesFill(S.freetpSiteBlocked, { status: dl.status });
+    return dl.pageUrl ? text + " " + fixesFill(S.freetpSiteBlockedPage, { page: dl.pageUrl }) : text;
+  }
+
   // PURE: what a click on the "Online Fix · No login" tile does — explain
   // that the game must be installed first, refresh the launch options only
   // (the receipt says the fix files are already in place), or fetch the fix
@@ -321,6 +334,7 @@
     window.__lumenFixesAppliedStates = fixesAppliedStates;
     window.__lumenFixesFallbackReceiptKind = fixesFallbackReceiptKind;
     window.__lumenFixesPickFreeTP = fixesPickFreeTP;
+    window.__lumenFixesFreeTPFailText = fixesFreeTPFailText;
     window.__lumenFixesOnlineTileAction = fixesOnlineTileAction;
     window.__lumenFixesFreshLine = fixesFreshLine;
     window.__lumenFixesFormatBytes = fixesFormatBytes;
@@ -1458,7 +1472,7 @@
         return fxDownloadFreeTP(appid, gameName, win, onPending).then(function (dl) {
           if (dl && dl.pending) return function () {};
           if (!(dl && dl.success && dl.path)) {
-            return pickerOr(FX_FREETP_NOT_FOUND[dl && dl.errorCode] ? S.freetpNone : S.freetpDownloadErr);
+            return pickerOr(fixesFreeTPFailText(S, dl));
           }
           return function () {
             fxInstallArchive(win, appid, ctx, {

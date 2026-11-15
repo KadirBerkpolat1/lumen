@@ -39,6 +39,18 @@ freetp.POLL_BUDGET = 0.25
 freetp.POLL_INTERVAL = 0.005
 local BASE_PATTERN = freetp.BASE_URL:gsub("%p", "%%%0")
 
+-- Statuses freetp.org answers when it refuses this client outright (403
+-- Forbidden, 451 Unavailable For Legal Reasons): a site or IP block that no
+-- retry gets past, so it is never retried and is reported apart from a
+-- transfer that failed.
+freetp.BLOCKED_STATUS = { [403] = true, [451] = true }
+
+-- fetch_error(status) -> "site_blocked" for a blocking HTTP status, else
+-- "download_failed".
+function freetp.fetch_error(status)
+  return freetp.BLOCKED_STATUS[status] and "site_blocked" or "download_failed"
+end
+
 -- Percent-encode a search query value (unreserved characters stay literal).
 function freetp.urlencode(value)
   return (tostring(value or ""):gsub("[^%w%-_%.~]", function(c)
@@ -123,11 +135,13 @@ function freetp.plain_query(name)
   return (tostring(name or ""):gsub("%p", ""):gsub("%s+", " "):gsub("^ ", ""):gsub(" $", ""))
 end
 
--- resolve(game_name, get, clock) -> { files, errorCode? }: the getfile
--- attachments of the game's po-seti article. errorCode says there is no
--- article (no_name, no_page) or it could not be looked up or read
--- (search_failed, page_failed), so a network failure is never mistaken for
--- "no fix". Search order: the name as is, then without punctuation, then the
+-- resolve(game_name, get, clock) -> { files, article?, errorCode?, status? }:
+-- the getfile attachments of the game's po-seti article (article is its url).
+-- errorCode says there is no article (no_name, no_page), it could not be
+-- looked up or read (search_failed, page_failed), or the site refused this
+-- client (site_blocked, with the HTTP status), so a network failure is never
+-- mistaken for "no fix". A blocked request ends the lookup: nothing more is
+-- requested. Search order: the name as is, then without punctuation, then the
 -- next result pages of those searches, within MAX_SEARCH_REQUESTS and
 -- SEARCH_BUDGET; then the article. clock defaults to os.time.
 function freetp.resolve(game_name, get, clock)
@@ -138,15 +152,16 @@ function freetp.resolve(game_name, get, clock)
   end
   clock = clock or os.time
   local deadline = clock() + freetp.SEARCH_BUDGET
-  local requests, failed = 0, false
+  local requests, failed, blocked = 0, false, nil
   local function search(query, page)
     local left = deadline - clock()
-    if requests >= freetp.MAX_SEARCH_REQUESTS or left <= 0 then return nil end
+    if blocked or requests >= freetp.MAX_SEARCH_REQUESTS or left <= 0 then return nil end
     requests = requests + 1
     local ok, r = pcall(get, freetp.search_url(query, page),
       { timeout = math.max(1, math.min(6, left)), max_bytes = freetp.PAGE_MAX_BYTES })
     if not ok or type(r) ~= "table" or r.status ~= 200 or type(r.body) ~= "string" then
       failed = true
+      if ok and type(r) == "table" and freetp.BLOCKED_STATUS[r.status] then blocked = r.status end
       return nil
     end
     return r.body
@@ -174,9 +189,14 @@ function freetp.resolve(game_name, get, clock)
     end
   end
   if not article then
-    res.errorCode = failed and "search_failed" or "no_page"
+    if blocked then
+      res.errorCode, res.status = "site_blocked", blocked
+    else
+      res.errorCode = failed and "search_failed" or "no_page"
+    end
     return res
   end
+  res.article = article.url
   local ok_a, page = pcall(get, article.url,
     { timeout = 6, max_bytes = freetp.PAGE_MAX_BYTES })
   if ok_a and type(page) == "table" and page.status == 200
@@ -186,6 +206,8 @@ function freetp.resolve(game_name, get, clock)
     -- rides along — the article was fetched anyway, so it costs nothing.
     local upd = freetp.parse_page_updated(page.body)
     if upd then res.updated, res.updatedNote = upd.epoch, upd.note end
+  elseif ok_a and type(page) == "table" and freetp.BLOCKED_STATUS[page.status] then
+    res.errorCode, res.status = "site_blocked", page.status
   else
     res.errorCode = "page_failed"
   end
@@ -323,8 +345,8 @@ end
 function freetp.start_download(appid, game_name, deps)
   deps = deps or {}
   local job = {}
-  local function fail(code)
-    job.result = { success = false, errorCode = code }
+  local function fail(code, status, page)
+    job.result = { success = false, errorCode = code, status = status, pageUrl = page }
     return job
   end
   job.appid = tonumber(appid)
@@ -333,7 +355,10 @@ function freetp.start_download(appid, game_name, deps)
   if not get or not start or not http_fn(deps, "poll") then return fail("http_unavailable") end
 
   local resolved = freetp.resolve(game_name, get, deps.clock)
-  if resolved.errorCode then return fail(resolved.errorCode) end
+  if resolved.errorCode then
+    return fail(resolved.errorCode, resolved.status,
+      resolved.errorCode == "site_blocked" and resolved.article or nil)
+  end
   local pick = freetp.pick_fix_file(resolved.files)
   if not pick then return fail("no_fix_file") end
   local ok, handle = pcall(start, freetp.BASE_URL
@@ -343,12 +368,14 @@ function freetp.start_download(appid, game_name, deps)
     max_bytes = freetp.MAX_FIX_BYTES,
   })
   if not ok or not handle then return fail("download_failed") end
-  job.pick, job.handle = pick, handle
+  job.pick, job.handle, job.article = pick, handle, resolved.article
   return job
 end
 
 -- Check the fetched body's file signature and store it as
--- <download dir>/<appid>-freetp-fix.<ext>.
+-- <download dir>/<appid>-freetp-fix.<ext>. A refused fetch keeps its HTTP
+-- status; a blocked one (site_blocked) also names the article page, where the
+-- fix can be downloaded by hand.
 local function store_download(job, dl, deps)
   local res = { success = false }
   local pick = job.pick
@@ -365,7 +392,9 @@ local function store_download(job, dl, deps)
 
   if type(dl) ~= "table" or dl.status ~= 200
       or type(dl.body) ~= "string" or #dl.body == 0 then
-    res.errorCode = "download_failed"
+    res.status = type(dl) == "table" and type(dl.status) == "number" and dl.status or nil
+    res.errorCode = freetp.fetch_error(res.status)
+    if res.errorCode == "site_blocked" then res.pageUrl = job.article or pick.url end
     return res
   end
   if not pick.ext then
@@ -406,9 +435,9 @@ local function timer_fns(deps)
 end
 
 -- poll_download(job, deps) -> the job's result once it has one,
--- { success, path, size } or { success = false, errorCode }; nil while the
--- file is still downloading. A failed download leaves no file of this appid
--- behind.
+-- { success, path, size } or { success = false, errorCode, status?, pageUrl? };
+-- nil while the file is still downloading. A failed download leaves no file
+-- of this appid behind.
 function freetp.poll_download(job, deps)
   deps = deps or {}
   if job.result then return job.result end

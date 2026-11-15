@@ -366,8 +366,71 @@ local dl_down = download_fix(4312190, "CRACK", {
   mkdir = function() return true end,
   write_file = function() return true end,
 })
-check("download: a failed fetch -> download_failed",
-  dl_down.success == false and dl_down.errorCode == "download_failed")
+check("download: a failed fetch -> download_failed, with its HTTP status",
+  dl_down.success == false and dl_down.errorCode == "download_failed" and dl_down.status == 404
+    and dl_down.pageUrl == nil)
+
+-- ── site_blocked: freetp.org refusing this client ──────────────────────────
+-- Measured on this host 2026-11-15: search and article pages answer 200,
+-- index.php?do=download answers HTTP 403.
+check("fetch_error: 403 and 451 are a site block",
+  ft.fetch_error(403) == "site_blocked" and ft.fetch_error(451) == "site_blocked")
+check("fetch_error: any other status, or none, is a failed download",
+  ft.fetch_error(404) == "download_failed" and ft.fetch_error(500) == "download_failed"
+    and ft.fetch_error(200) == "download_failed" and ft.fetch_error(401) == "download_failed"
+    and ft.fetch_error(nil) == "download_failed" and ft.fetch_error("403") == "download_failed")
+
+local CRACK_ARTICLE = "https://freetp.org/po-seti/7365-crack-po-seti-besplatno.html"
+for _, status in ipairs({ 403, 451 }) do
+  local writes = 0
+  local get_blocked, blocked_calls = fake_chain({ article = GETFILE_PAGE_HTML,
+    download = { status = status, body = "<!doctype html><title>403 | FreeTP.org</title>" } })
+  local dl_blocked = download_fix(4312190, "CRACK", {
+    get = get_blocked, dl_dir = "/tmp/ftdl", mkdir = function() return true end,
+    write_file = function() writes = writes + 1; return true end, remove_file = function() end,
+  })
+  check("download: HTTP " .. status .. " -> site_blocked with the status and the article page",
+    dl_blocked.success == false and dl_blocked.errorCode == "site_blocked"
+      and dl_blocked.status == status and dl_blocked.pageUrl == CRACK_ARTICLE)
+  check("download: HTTP " .. status .. " is fetched once, never retried, and nothing is written",
+    #blocked_calls == 3 and writes == 0)
+end
+
+do
+  local requests = 0
+  local r_blocked = ft.resolve("R.E.P.O.", function()
+    requests = requests + 1
+    return { status = 403, body = "blocked" }
+  end)
+  check("resolve: a blocked search is site_blocked with its status, and nothing more is requested",
+    r_blocked.errorCode == "site_blocked" and r_blocked.status == 403 and requests == 1)
+
+  local r_art_blocked = ft.resolve("CRACK", function(url)
+    if url:find("do=search", 1, true) then return { status = 200, body = SEARCH_HTML } end
+    return { status = 451, body = "" }
+  end)
+  check("resolve: a blocked article page is site_blocked, naming the article",
+    r_art_blocked.errorCode == "site_blocked" and r_art_blocked.status == 451
+      and r_art_blocked.article == CRACK_ARTICLE and #r_art_blocked.files == 0)
+
+  local dl_search_blocked = download_fix(4312190, "CRACK", {
+    get = function() return { status = 403, body = "" } end, dl_dir = "/tmp/ftdl",
+    mkdir = function() return true end, write_file = function() return true end,
+  })
+  check("download: blocked before an article was found -> site_blocked, no page to name",
+    dl_search_blocked.errorCode == "site_blocked" and dl_search_blocked.status == 403
+      and dl_search_blocked.pageUrl == nil)
+
+  local breg = {}
+  ft.register(breg, as_job({
+    get = (fake_chain({ article = GETFILE_PAGE_HTML, download = { status = 403, body = "x" } })),
+    dl_dir = "/tmp/ftdl", mkdir = function() return true end,
+    write_file = function() return true end, remove_file = function() end }))
+  local dec_blocked = require("json").decode(breg.LumenDownloadFreeTPFix(4312190, "", "CRACK"))
+  check("register: the RPC answer keeps site_blocked, the HTTP status and the page",
+    dec_blocked.success == false and dec_blocked.errorCode == "site_blocked"
+      and dec_blocked.status == 403 and dec_blocked.pageUrl == CRACK_ARTICLE)
+end
 
 local dl_page_down = download_fix(4312190, "CRACK", {
   get = function(url)
