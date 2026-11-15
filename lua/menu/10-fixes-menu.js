@@ -276,6 +276,21 @@
     return needs && launch.previousLaunchOptions !== launch.launchOptions ? "needsOptions" : "applied";
   }
 
+  // PURE: may the local-fix probe light the FreeTP badge? The probe's state is
+  // provider-blind — any fix with its launch options in place reads "applied",
+  // whoever installed it. Only attribute when Lumen's install record does not
+  // name another provider: "freetp" and "archive" records (the archive picker
+  // is FreeTP's manual path) and unrecorded finds may light it; an
+  // online-fix.me install ("onlinefix") or an EOS emulator record (kind
+  // "eos_emu") may not — those fixes already light their own tiles, and one
+  // fix wearing two providers' badges reads as two applied fixes (B-22).
+  function fixesFreetpProbeOk(probe) {
+    if (!probe) return false;
+    if (probe.recorded === "onlinefix") return false;
+    if (probe.recordedKind === "eos_emu") return false;
+    return true;
+  }
+
   // PURE: whether a __lumen* relay call answered ok. The relay RESOLVES with
   // {ok:false} when Steam's client bridge is unavailable (e.g. Steam is still
   // starting after a restart) — that is not a promise rejection, so every
@@ -365,6 +380,7 @@
     window.__lumenFixesFreshLine = fixesFreshLine;
     window.__lumenFixesFormatBytes = fixesFormatBytes;
     window.__lumenFixesLocalFixState = fixesLocalFixState;
+    window.__lumenFixesFreetpProbeOk = fixesFreetpProbeOk;
     window.__lumenFixesRelayOk = fixesRelayOk;
     window.__lumenFixesFill = fixesFill;
   } catch (e) {}
@@ -1300,6 +1316,9 @@
         if (probe.recorded === "onlinefix" && probe.state !== "none") onlineTile = swap(onlineTile, onlineTileFor(true));
         if (fixesEosState(probe) !== "none") eosTile = swap(eosTile, eosTileFor(fixesEosState(probe)));
         if (probe.state !== "applied" && probe.state !== "needsOptions") return;
+        // The probe is provider-blind: another provider's fix must not light
+        // the FreeTP badge, or one fix shows as two applied fixes (B-22).
+        if (!fixesFreetpProbeOk(probe)) return;
         freetpTile = swap(freetpTile, freetpTileFor(probe.state));
       }).catch(function () {});
     }

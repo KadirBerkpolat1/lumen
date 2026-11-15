@@ -64,6 +64,7 @@ const pickFreeTP = win.__lumenFixesPickFreeTP;
 const onlineAction = win.__lumenFixesOnlineTileAction;
 const formatBytes = win.__lumenFixesFormatBytes;
 const localFixState = win.__lumenFixesLocalFixState;
+const freetpProbeOk = win.__lumenFixesFreetpProbeOk;
 const relayOk = win.__lumenFixesRelayOk;
 const catalogueFilter = win.__lumenLuaToolsFilterFixGames;
 const normalizeCatalogueTag = win.__lumenLuaToolsNormalizeFixTag;
@@ -320,6 +321,24 @@ if (typeof localFixState !== "function") {
   eq("local: no launch-options answer at all is not 'applied'", localFixState({ found: true }, null), "unknown");
   eq("local: no fix evidence -> none", localFixState({ found: false }, opts), "none");
   eq("local: nullish detection -> none", localFixState(null, opts), "none");
+}
+
+// ── FreeTP badge attribution (the probe is provider-blind; B-22) ────────────
+if (typeof freetpProbeOk !== "function") {
+  console.error("FAIL FreeTP probe attribution helper is not exposed");
+  failures++;
+} else {
+  eq("freetp badge: an online-fix.me install must not pose as FreeTP",
+    freetpProbeOk({ state: "applied", recorded: "onlinefix" }), false);
+  eq("freetp badge: an EOS emulator record must not pose as FreeTP",
+    freetpProbeOk({ state: "applied", recorded: "archive", recordedKind: "eos_emu" }), false);
+  eq("freetp badge: Lumen's own FreeTP download counts",
+    freetpProbeOk({ state: "applied", recorded: "freetp" }), true);
+  eq("freetp badge: the manual archive path counts (FreeTP from Downloads)",
+    freetpProbeOk({ state: "applied", recorded: "archive", recordedKind: "generic" }), true);
+  eq("freetp badge: unrecorded files already in the folder count",
+    freetpProbeOk({ state: "applied", recorded: null }), true);
+  eq("freetp badge: no probe -> no badge", freetpProbeOk(null), false);
 }
 
 // ── Steam relay result check (the {ok:false} silent-failure fix) ────────────
