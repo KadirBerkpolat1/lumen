@@ -49,6 +49,11 @@ local function file_size(path)
   return tonumber(size) or 0
 end
 
+local function file_ino(path)
+  if not path or path == "" then return nil end
+  return lfs.attributes(path, "ino")
+end
+
 function webhelperwatch.new(opts)
   opts = opts or {}
   local home = os.getenv("HOME") or ""
@@ -60,6 +65,7 @@ function webhelperwatch.new(opts)
   return setmetatable({
     state = webhelperwatch.new_state(),
     log_path = log_path,
+    log_ino = file_ino(log_path),
     log_offset = file_size(log_path),
     decky_present = decky == true,
   }, Watcher)
@@ -73,11 +79,16 @@ function Watcher:reset_session()
 end
 
 -- Read only bytes appended after Lumen started. This avoids treating a stale
--- rewrite line from a previous Steam session as proof for the current one.
+-- rewrite line from a previous Steam session as proof for the current one,
+-- while resetting to byte 0 when slsteam-moon rotates the log at Steam start.
 function Watcher:poll_rewrite()
   if not self.log_path or self.log_path == "" then return false end
+  local ino = file_ino(self.log_path)
   local size = file_size(self.log_path)
-  if size < self.log_offset then self.log_offset = 0 end
+  if (self.log_ino ~= nil and ino ~= nil and ino ~= self.log_ino) or size < self.log_offset then
+    self.log_offset = 0
+  end
+  self.log_ino = ino
   if size == self.log_offset then return false end
 
   local file = io.open(self.log_path, "rb")

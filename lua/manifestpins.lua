@@ -1079,10 +1079,19 @@ end
 -- ── IO layer ────────────────────────────────────────────────────────────────
 local function home() return os.getenv("HOME") or "" end
 
+local function sls_config_dir(getenv)
+  getenv = getenv or os.getenv
+  local xdg = getenv("XDG_CONFIG_HOME") or ""
+  if xdg:sub(1, 1) == "/" then return xdg .. "/SLSsteam" end
+  local h = getenv("HOME") or ""
+  if h == "" then return nil end
+  return h .. "/.config/SLSsteam"
+end
+
 local function is_providers_offline()
-  local h = home()
-  if h == "" then return false end
-  local p = h .. "/.config/SLSsteam/offline"
+  local dir = sls_config_dir()
+  if not dir then return false end
+  local p = dir .. "/offline"
   local f = io.open(p, "rb")
   if f then
     f:close()
@@ -1109,9 +1118,9 @@ local function is_auto_update_enabled(config_path)
 end
 
 local function is_game_offline(appid)
-  local h = home()
-  if h == "" then return false end
-  local p = h .. "/.config/SLSsteam/offline_" .. tostring(appid)
+  local dir = sls_config_dir()
+  if not dir then return false end
+  local p = dir .. "/offline_" .. tostring(appid)
   local f = io.open(p, "rb")
   if f then
     f:close()
@@ -1120,8 +1129,9 @@ local function is_game_offline(appid)
   return false
 end
 
-local function steam_root_guess()
-  local h = home()
+local function steam_root_guess(getenv)
+  getenv = getenv or os.getenv
+  local h = getenv("HOME") or ""
   if h == "" then return nil end
   local candidates = {
     h .. "/.steam/steam",
@@ -1135,19 +1145,21 @@ local function steam_root_guess()
   return h .. "/.steam/steam"
 end
 
--- default_ctx() -> resolved paths for the real install.
-function mp.default_ctx()
-  local h = home()
-  local root = steam_root_guess()
+-- default_ctx([getenv]) -> resolved paths for the real install.
+function mp.default_ctx(getenv)
+  getenv = getenv or os.getenv
+  local h = getenv("HOME") or ""
+  local cfg_dir = sls_config_dir(getenv)
+  local root = steam_root_guess(getenv)
   return {
-    config_path = (h ~= "" and (h .. "/.config/SLSsteam/config.yaml")) or nil,
+    config_path = cfg_dir and (cfg_dir .. "/config.yaml") or nil,
     stplug_dir = root and (root .. "/config/stplug-in") or nil,
-    manifests_dir = (h ~= "" and (h .. "/.config/SLSsteam/manifests")) or nil,
-    cache_dir = (h ~= "" and (h .. "/.config/SLSsteam/cache")) or nil,
+    manifests_dir = cfg_dir and (cfg_dir .. "/manifests") or nil,
+    cache_dir = cfg_dir and (cfg_dir .. "/cache") or nil,
     metadata_cache_dir = (h ~= "" and (h .. "/.local/share/Lumen/cache/game-updates")) or nil,
-    imports_path = (h ~= "" and (h .. "/.config/SLSsteam/lumen_lua_imports.txt")) or nil,
+    imports_path = cfg_dir and (cfg_dir .. "/lumen_lua_imports.txt") or nil,
     import_root = (h ~= "" and (h .. "/.local/share/Lumen/imports")) or nil,
-    offline_path = (h ~= "" and (h .. "/.config/SLSsteam/offline")) or nil,
+    offline_path = cfg_dir and (cfg_dir .. "/offline") or nil,
     steam_root = root,
   }
 end

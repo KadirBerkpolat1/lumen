@@ -229,7 +229,6 @@
         autoUpdateOffBody: "Automatic game updates are turned off, so games stay on their installed build. To turn them back on, enable \"Auto-update apps\" in the slsteam-moon tab.",
       },
       keys: {
-        PlayNotOwnedGames: { label: "Play not-owned games", desc: "Lets Steam launch games that aren't in your account.", info: "You don't need to turn this on. Games you add through LuaTools are injected and install either way — this switch doesn't change that." },
         DisableFamilyShareLock: { label: "Disable Family Sharing lock", desc: "Stops Family Sharing from locking your games when someone else is playing on a shared library." },
         DisableParentalRestrictions: {
           label: "Disable parental restrictions",
@@ -239,13 +238,10 @@
           restartNow: "Restart Steam",
           restartLater: "Later",
         },
-        AutoFilterList: { label: "Auto-filter app list", desc: "Automatically limits ownership checks to games and applications. Best left on." },
         UseWhitelist: { label: "Use a whitelist", desc: "Treats the AppIds list as a whitelist (only those) instead of a blacklist (all but those)." },
-        SafeMode: { label: "Safe mode", desc: "Automatically turns slsteam-moon off if Steam's client file doesn't match a known-good version. Useful on Steam Deck game mode." },
         Notifications: { label: "Notifications", desc: "Show desktop notifications from slsteam-moon (uses notify-send)." },
         NotifyInit: { label: "Notify when ready", desc: "Show a notification once slsteam-moon has finished loading." },
-        WarnHashMissmatch: { label: "Warn on client change", desc: "Notify when Steam's client file differs from the known-good version. Mostly for development." },
-        API: { label: "Control socket (API)", desc: "Lets external tools send commands to slsteam-moon through a local socket." },
+        API: { label: "Control channel (API)", desc: "Lets external tools send commands to slsteam-moon through $XDG_RUNTIME_DIR/SLSsteam/api." },
         DisableCloud: { label: "Disable Steam Cloud", desc: "Keep this OFF if you use CloudRedirect for cloud saves. Turn it ON only if you don't sync saves at all." },
         AutoUpdateApps: {
           label: "Auto-update apps",
@@ -630,7 +626,6 @@
         autoUpdateOffBody: "As atualizações automáticas de jogos estão desativadas, então os jogos ficam travados no build instalado. Para reativá-las, ligue \"Atualizar jogos automaticamente\" na aba slsteam-moon.",
       },
       keys: {
-        PlayNotOwnedGames: { label: "Jogar jogos não adquiridos", desc: "Permite que a Steam abra jogos que não estão na sua conta.", info: "Você não precisa ativar isso. Os jogos que você adiciona pelo LuaTools são injetados e instalam de qualquer jeito — esta opção não muda isso." },
         DisableFamilyShareLock: { label: "Desativar trava do Family Share", desc: "Impede que o Compartilhamento Familiar trave seus jogos quando outra pessoa está jogando numa biblioteca compartilhada." },
         DisableParentalRestrictions: {
           label: "Desativar restrições parentais",
@@ -640,13 +635,10 @@
           restartNow: "Reiniciar Steam",
           restartLater: "Depois",
         },
-        AutoFilterList: { label: "Filtrar lista de apps automaticamente", desc: "Limita as verificações de propriedade a jogos e aplicativos automaticamente. Melhor deixar ligado." },
         UseWhitelist: { label: "Usar lista de permissões", desc: "Trata a lista de AppIds como permissões (só esses) em vez de bloqueio (todos menos esses)." },
-        SafeMode: { label: "Modo seguro", desc: "Desliga o slsteam-moon automaticamente se o arquivo do cliente Steam não bater com uma versão conhecida. Útil no modo jogo do Steam Deck." },
         Notifications: { label: "Notificações", desc: "Mostra notificações da área de trabalho do slsteam-moon (usa notify-send)." },
         NotifyInit: { label: "Avisar quando pronto", desc: "Mostra uma notificação quando o slsteam-moon termina de carregar." },
-        WarnHashMissmatch: { label: "Avisar se o cliente mudar", desc: "Notifica quando o arquivo do cliente Steam muda em relação à versão conhecida. Útil principalmente para desenvolvimento." },
-        API: { label: "Soquete de controle (API)", desc: "Permite que ferramentas externas enviem comandos ao slsteam-moon por um soquete local." },
+        API: { label: "Canal de controle (API)", desc: "Permite que ferramentas externas enviem comandos ao slsteam-moon por $XDG_RUNTIME_DIR/SLSsteam/api." },
         DisableCloud: { label: "Desativar Steam Cloud", desc: "Deixe DESLIGADO se você usa o CloudRedirect para saves na nuvem. Ligue só se você não sincroniza saves." },
         AutoUpdateApps: {
           label: "Atualizar jogos automaticamente",
