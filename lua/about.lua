@@ -21,37 +21,51 @@ local privatefs = require("privatefs")
 
 local about = {}
 
--- The three stack components, in display order. `key` matches the versions.json
--- field the installer writes; `repo` is the GitHub owner/name for the API;
--- `asset_pat` is a Lua pattern matching the release asset filename (so we can
--- read THAT asset's fingerprint, not just the tag).
+-- The three stack components as the moon64 stack ships them, in display
+-- order. slsteam-moon comes from this project's slsteam-moon-x64 releases;
+-- Lumen and the LuaTools plugin are installed by overlay from the pinned
+-- forks, so their identity is the installed branch commit. `source` picks the
+-- lookup: "release" reads GitHub releases/latest and `asset_pat` reads THAT
+-- asset's fingerprint, not just the tag; "branch" reads commits/<branch> and
+-- uses the commit sha as the identity (the sha-as-id scheme the beta channel
+-- uses for Git blobs). `mirror_key` deliberately does NOT match the keys of
+-- swwayps's jsDelivr manifest: that mirror tracks upstream releases, never
+-- this fork, so the fallback must stay inert instead of serving upstream
+-- data as if it were this stack's.
 about.COMPONENTS = {
-  { key = "slsteam_moon", name = "slsteam-moon",    repo = "swwayps/slsteam-moon",
-    mirror_key = "slsteam-moon",
-    asset_pat = "^slsteam%-moon%-linux%-.*%-lumen%.zip$",
-    beta_path = "dist/slsteam-moon-linux.zip" },
-  { key = "plugin",       name = "LuaTools plugin", repo = "swwayps/luatools-moon",
-    mirror_key = "plugin",
-    asset_pat = "^luatools%-linux%.zip$",
+  { key = "slsteam_moon", name = "slsteam-moon",    repo = "KadirBerkpolat1/slsteam-moon-x64",
+    mirror_key = "slsteam-moon-x64", source = "release",
+    asset_pat = "^SLSsteam%.so$",
+    beta_path = "bin/SLSsteam.so" },
+  { key = "plugin",       name = "LuaTools plugin", repo = "KadirBerkpolat1/luatools-moon",
+    mirror_key = "plugin-moon64", source = "branch", branch = "main",
     beta_path = "dist/luatools-linux.zip" },
-  { key = "lumen",        name = "Lumen",           repo = "swwayps/lumen",
-    mirror_key = "lumen",
-    asset_pat = "^lumen%-linux%.zip$",
+  { key = "lumen",        name = "Lumen",           repo = "KadirBerkpolat1/lumen",
+    mirror_key = "lumen-moon64", source = "branch", branch = "main",
     beta_path = "dist/lumen-linux.zip" },
 }
 
 about.MIRROR_MANIFEST_URL =
   "https://cdn.jsdelivr.net/gh/swwayps/jsdelivr@main/manifest.json"
 
--- The public one-liner the Update All button runs in a terminal. Raw-branch URL
--- (not a release asset) so installer fixes go live without a rebuild.
+-- The moon64 one-liner the Update All button runs in a terminal: it stages the
+-- whole pinned fork stack (prebuilt SLSsteam + the Lumen/LuaTools overlay).
+-- Raw-branch URL (not a release asset) so installer fixes go live without a
+-- rebuild.
 about.INSTALL_URL =
-  "https://raw.githubusercontent.com/swwayps/luatools-moon/main/install.sh"
+  "https://raw.githubusercontent.com/KadirBerkpolat1/moon64/main/get.sh"
 
--- Where the installer stamps the installed release tags.
-function about.versions_path()
-  local home = os.getenv("HOME") or ""
-  return home .. "/.local/share/Lumen/versions.json"
+-- Where the installer stamps the installed versions. moon64's installer
+-- writes moon64-versions.json next to the upstream stamp; the fork's tab
+-- prefers it (it records the fork release tag and the branch commits the
+-- stack really runs) and falls back to the upstream file for trees moon64
+-- never patched.
+function about.versions_path(home)
+  home = home or os.getenv("HOME") or ""
+  local dir = home .. "/.local/share/Lumen"
+  local f = io.open(dir .. "/moon64-versions.json", "rb")
+  if f then f:close() return dir .. "/moon64-versions.json" end
+  return dir .. "/versions.json"
 end
 
 -- Unified update-channel preference. The file keeps the legacy per-component
@@ -242,6 +256,12 @@ function about.api_url(repo)
   return "https://api.github.com/repos/" .. repo .. "/releases/latest"
 end
 
+-- API URL for a branch component's HEAD commit (the identity of a component
+-- installed by overlay from a pinned branch).
+function about.branch_api_url(component)
+  return "https://api.github.com/repos/" .. component.repo .. "/commits/" .. component.branch
+end
+
 function about.parse_mirror_manifest(body)
   if type(body) ~= "string" or body == "" then return nil end
   local ok, data = pcall(json.decode, body)
@@ -333,14 +353,38 @@ function about.parse_latest_info(body, asset_pat)
   return info
 end
 
--- fetch_latest_info(component, http_mod) -> { tag, asset_at, size } or nil.
+-- parse_commit_info(body) -> { tag, id, asset_at } for a branch component's
+-- HEAD commit, or nil. Pure (decode only). The commit sha is the identity: it
+-- is both the display tag (first 7 chars) and the `id` compare_state matches,
+-- the same sha-as-id scheme the beta channel uses for Git blobs.
+function about.parse_commit_info(body)
+  if type(body) ~= "string" or body == "" then return nil end
+  local ok, data = pcall(json.decode, body)
+  if not ok or type(data) ~= "table" then return nil end
+  local sha = type(data.sha) == "string" and data.sha or nil
+  if not sha or #sha < 7 then return nil end
+  local date = type(data.commit) == "table" and type(data.commit.committer) == "table"
+    and data.commit.committer.date or nil
+  return {
+    tag = sha:sub(1, 7),
+    id = sha,
+    asset_at = (type(date) == "string" and date ~= "" and date) or nil,
+  }
+end
+
+-- fetch_latest_info(component, http_mod) -> { tag, asset_at, size, id } or nil.
 -- Short timeout so a slow/down forge doesn't stall the injector loop.
 function about.fetch_latest_info(component, http_mod)
-  local r, _ = http_mod.get(about.api_url(component.repo), {
+  local url = component.source == "branch"
+    and about.branch_api_url(component) or about.api_url(component.repo)
+  local r, _ = http_mod.get(url, {
     timeout = 6,
     headers = { ["Accept"] = "application/json", ["User-Agent"] = "lumen" },
   })
   if not r or r.status ~= 200 then return nil end
+  if component.source == "branch" then
+    return about.parse_commit_info(r.body)
+  end
   return about.parse_latest_info(r.body, component.asset_pat)
 end
 
@@ -456,7 +500,8 @@ function about.new_update_probe(opts)
     if include_plugin or component.key ~= "plugin" then
       probe.tasks[#probe.tasks + 1] = {
         component = component,
-        stable = start(about.api_url(component.repo)),
+        stable = start(component.source == "branch"
+          and about.branch_api_url(component) or about.api_url(component.repo)),
         beta = probe.channels[component.key] == "beta"
           and start(about.beta_api_url(component)) or { done = true },
       }
@@ -498,8 +543,13 @@ function about.poll_update_probe(probe)
   for _, task in ipairs(probe.tasks) do
     local stable_response = task.stable.response
     local beta_response = task.beta.response
+    local parse_stable = task.component.source == "branch"
+      and about.parse_commit_info
+      or function(body)
+        return about.parse_latest_info(body, task.component.asset_pat)
+      end
     local stable_latest = stable_response and stable_response.status == 200
-      and about.parse_latest_info(stable_response.body, task.component.asset_pat) or nil
+      and parse_stable(stable_response.body) or nil
     if not stable_latest or stable_latest.id == nil then
       stable_latest = about.mirror_info(mirror_manifest,
         task.component.mirror_key or task.component.key) or stable_latest
@@ -583,7 +633,8 @@ function about.update_script(install_url, flag)
     "status=$?",
     "echo",
     'if [ "$status" -eq 0 ]; then',
-    '  echo "Done. Restart Steam to apply the updates."',
+    '  echo "Done. Lumen/LuaTools load on the next Steam start."',
+    '  echo "Activate the staged SLSsteam with: ~/.local/share/moon64/moon64 on (with Steam closed)."',
     "else",
     '  echo "Update exited with status $status."',
     "fi",
@@ -628,7 +679,7 @@ function about.update_all(opts)
     return {
       success = false,
       error = "No terminal emulator found. Run the installer manually: "
-        .. "curl -fsSL " .. about.INSTALL_URL .. " | bash",
+        .. "curl -fsSL " .. about.INSTALL_URL .. " | bash -s -- --with-lumen-patch",
     }
   end
 
@@ -646,23 +697,27 @@ function about.update_all(opts)
   return { success = true, terminal = term.bin }
 end
 
--- Deterministic installer argv for the unified channel. The installer still
--- receives one flag per component for compatibility and independently falls
--- back to Stable when a component has no Beta artifact. --noplugin removes the
--- absent plugin's flag.
-function about.channel_flags(channels, no_plugin)
-  channels = about.normalize_channels(channels)
-  local flags = {
-    "--slsteam-channel", channels.slsteam_moon,
-  }
-  if not no_plugin then
-    flags[#flags + 1] = "--plugin-channel"
-    flags[#flags + 1] = channels.plugin
-  end
-  flags[#flags + 1] = "--lumen-channel"
-  flags[#flags + 1] = channels.lumen
-  if no_plugin then flags[#flags + 1] = "--noplugin" end
+-- Flags for the moon64 get.sh update path. --with-lumen-patch always: the
+-- fork's Lumen/LuaTools trees are the point of an update, and get.sh refuses
+-- unknown flags. --with-cloudredirect only when a CloudRedirect pair is
+-- already installed: building it needs a toolchain, so a machine without one
+-- keeps its existing pair instead of failing the whole update.
+function about.update_flags(cr_present)
+  local flags = { "--with-lumen-patch" }
+  if cr_present then flags[#flags + 1] = "--with-cloudredirect" end
   return flags
+end
+
+-- True when the 64-bit CloudRedirect hook is installed (injectable `exists`
+-- for host tests, the same shape slsconfig.has_cloudredirect uses).
+function about.cloudredirect_installed(home, exists)
+  home = home or os.getenv("HOME") or ""
+  if home == "" then return false end
+  exists = exists or function(p)
+    local f = io.open(p, "rb"); if f then f:close() return true end
+    return false
+  end
+  return exists(home .. "/.local/share/CloudRedirect/cloud_redirect.so") and true or false
 end
 
 -- register(registry[, opts]): install GetAboutVersions / UpdateAll, wrapping the
@@ -746,9 +801,8 @@ function about.register(registry, opts)
     return json.encode({ success = ok and true or false, error = err })
   end
   registry.UpdateAll = function()
-    local channels = about.read_channels(channel_path, opts.read_file)
     return json.encode(about.update_all({
-      flags = about.channel_flags(channels, no_plugin),
+      flags = about.update_flags(about.cloudredirect_installed()),
     }))
   end
   return registry

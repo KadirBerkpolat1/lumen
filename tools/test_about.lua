@@ -108,6 +108,21 @@ check("parse missing tag", about.parse_latest_info('{"assets":[]}', "^x$") == ni
 check("parse bad json", about.parse_latest_info("not json", "^x$") == nil)
 check("parse empty", about.parse_latest_info("", "^x$") == nil)
 
+-- ── parse_commit_info (branch components) ─────────────────────────────
+do
+  local info = about.parse_commit_info(
+    '{"sha":"0123456789abcdef0123","commit":{"committer":{"date":"2026-11-20T19:30:00Z"}}}')
+  check("commit parse tag is short sha", info and info.tag == "0123456")
+  check("commit parse id is full sha", info and info.id == "0123456789abcdef0123")
+  check("commit parse date", info and info.asset_at == "2026-11-20T19:30:00Z")
+end
+check("commit parse missing sha",
+  about.parse_commit_info('{"commit":{"committer":{"date":"x"}}}') == nil)
+check("commit parse short sha",
+  about.parse_commit_info('{"sha":"0123"}') == nil)
+check("commit parse bad json", about.parse_commit_info("nope") == nil)
+check("commit parse empty", about.parse_commit_info("") == nil)
+
 -- ── jsDelivr release manifest fallback ─────────────────────────────────────
 local mirror_body = '{"schema":1,"components":{'
   .. '"slsteam-moon":{"tag":"v2.9","id":291,"asset_at":"2026-09-02T00:00:00Z","size":491},'
@@ -124,6 +139,9 @@ if mirror_ready then
   check("mirror preserves replacement fingerprint", info
     and info.id == 293 and info.asset_at == "2026-09-02T00:00:00Z"
       and info.size == 493)
+  check("mirror ignores fork-only keys",
+    about.mirror_info(manifest, "lumen-moon64") == nil
+      and about.mirror_info(manifest, "slsteam-moon-x64") == nil)
   check("mirror rejects wrong schema",
     about.parse_mirror_manifest('{"schema":2,"components":{}}') == nil)
 end
@@ -143,6 +161,22 @@ check("installed missing file -> {}",
   next(about.read_installed("x", function() return nil end)) == nil)
 check("installed bad json -> {}",
   next(about.read_installed("x", reader_returning("garbage"))) == nil)
+
+-- ── versions_path prefers the moon64 stamp ─────────────────────────────
+do
+  local root = "/tmp/lumen-about-test." .. tostring(os.time())
+    .. "." .. tostring(math.floor(os.clock() * 1000))
+  local dir = root .. "/.local/share/Lumen"
+  os.execute('mkdir -p "' .. dir .. '"')
+  check("versions_path falls back to the upstream stamp",
+    about.versions_path(root) == dir .. "/versions.json")
+  local f = assert(io.open(dir .. "/moon64-versions.json", "wb"))
+  f:write("{}")
+  f:close()
+  check("versions_path prefers the moon64 stamp",
+    about.versions_path(root) == dir .. "/moon64-versions.json")
+  os.execute('rm -rf "' .. root .. '"')
+end
 
 -- ── update channel preferences ──────────────────────────────────────────────
 local channels_ready = type(about.normalize_channels) == "function"
@@ -240,6 +274,23 @@ do
   check("fetch nil resp",
     about.fetch_latest_info(comp, { get = function() return nil, "err" end }) == nil)
 end
+do
+  local comp = { source = "branch", repo = "a/b", branch = "main" }
+  local seen_url
+  local info = about.fetch_latest_info(comp, { get = function(url)
+    seen_url = url
+    if url ~= about.branch_api_url(comp) then return { status = 200, body = "{}" } end
+    return { status = 200,
+      body = '{"sha":"0123456789abcdef0123","commit":{"committer":{"date":"2026-11-20T19:30:00Z"}}}' }
+  end })
+  check("branch fetch uses the commits API",
+    seen_url == "https://api.github.com/repos/a/b/commits/main")
+  check("branch fetch parses the commit",
+    info and info.tag == "0123456" and info.id == "0123456789abcdef0123")
+end
+check("branch fetch down -> nil",
+  about.fetch_latest_info({ source = "branch", repo = "a/b", branch = "main" },
+    { get = function() return nil, "err" end }) == nil)
 
 -- ── get_versions orchestration ───────────────────────────────────────────────
 -- Non-blocking boot update probe. The menubar must not run six synchronous
@@ -250,13 +301,12 @@ local has_async_probe = type(about.new_update_probe) == "function"
 check("exports non-blocking update probe", has_async_probe)
 if has_async_probe then
   local started, first_poll_started = 0, nil
-  local function release_body(url)
-    local plugin = url:find("luatools%-moon") ~= nil
-    local name = url:find("/lumen/", 1, true) and "lumen-linux.zip"
-      or plugin and "luatools-linux.zip"
-      or "slsteam-moon-linux-2.8-lumen.zip"
-    return '{"tag_name":"v2.8","assets":[{"name":"' .. name
-      .. '","id":' .. (plugin and "2" or "1") .. ',"size":100}]}'
+  local function release_body()
+    return '{"tag_name":"v2.8","assets":[{"name":"SLSsteam.so","id":1,"size":100}]}'
+  end
+  local function commit_body()
+    return '{"sha":"ddd4444444444444444444444444444444444444",' ..
+      '"commit":{"committer":{"date":"2026-06-01T00:00:00Z"}}}'
   end
   local async_http = {
     start = function(url)
@@ -270,7 +320,10 @@ if has_async_probe then
       if handle.url:find("/contents/", 1, true) then
         return true, { status = 404, body = "{}" }
       end
-      return true, { status = 200, body = release_body(handle.url) }
+      if handle.url:find("/commits/", 1, true) then
+        return true, { status = 200, body = commit_body() }
+      end
+      return true, { status = 200, body = release_body() }
     end,
   }
   local probe = about.new_update_probe({
@@ -295,32 +348,39 @@ if has_async_probe then
 end
 
 do
-  -- installed plugin asset_at is OLDER than the API's -> "update" (same tag,
-  -- re-uploaded asset). slsteam_moon matches exactly -> "current". lumen has no
-  -- installed entry -> "unknown".
-  local api_body = function(url)
-    -- Every repo returns v2.6 with a matching asset uploaded at 06-21.
-    local name = url:find("lumen", 1, true) and "lumen-linux.zip"
-      or url:find("luatools-moon", 1, true) and "luatools-linux.zip"
-      or "slsteam-moon-linux-2.6-lumen.zip"
-    return '{"tag_name":"v2.6","assets":[{"name":"' .. name ..
-      '","id":100,"created_at":"2026-06-21T03:15:25Z","size":100}]}'
+  -- Fork tracking: slsteam-moon from the slsteam-moon-x64 release; lumen and
+  -- plugin from the pinned forks' branch HEADs (commit sha as identity).
+  -- Installed: sls release tag matches -> current; plugin stamp carries an
+  -- older commit -> update; lumen has no installed entry -> unknown.
+  local commit_body = function(sha)
+    return '{"sha":"' .. sha .. '","commit":{"committer":{"date":"2026-06-21T03:15:25Z"}}}'
   end
-  local http = { get = function(url) return { status = 200, body = api_body(url) }, nil end }
+  local http = { get = function(url)
+    if url:find("/commits/", 1, true) then
+      if url:find("/lumen/", 1, true) then
+        return { status = 200,
+          body = commit_body("aaa1111111111111111111111111111111111111") }, nil
+      end
+      return { status = 200,
+        body = commit_body("bbb2222222222222222222222222222222222222") }, nil
+    end
+    return { status = 200, body =
+      '{"tag_name":"v20261120203232","assets":[{"name":"SLSsteam.so","id":100,' ..
+      '"created_at":"2026-11-20T20:32:32Z","size":17312520}]}' }, nil
+  end }
   local res = about.get_versions({
     http = http,
     read_file = reader_returning(
-      '{"slsteam_moon":{"tag":"v2.6","asset_at":"2026-06-21T03:15:25Z","size":100},' ..
-      '"plugin":{"tag":"v2.6","asset_at":"2026-06-17T00:00:00Z","size":100}}'),
+      '{"slsteam_moon":{"tag":"v20261120203232"},' ..
+      '"plugin":{"tag":"6a222ad","id":"6a222adffffffffffffffffffffffffffffffff"}}'),
   })
   check("gv success", res.success == true and #res.components == 3)
   local by = {}
   for _, c in ipairs(res.components) do by[c.key] = c end
-  check("gv sls current (same asset)", by.slsteam_moon.state == "current")
-  check("gv plugin update (asset re-uploaded, same tag)", by.plugin.state == "update")
-  check("gv plugin shows build dates", by.plugin.installedBuild == "17/06/2026"
-    and by.plugin.latestBuild == "21/06/2026")
-  check("gv plugin shows latest asset id", by.plugin.latestAsset == "#100")
+  check("gv sls current (release tag matches)", by.slsteam_moon.state == "current")
+  check("gv plugin update (branch moved)", by.plugin.state == "update")
+  check("gv plugin shows the latest commit", by.plugin.latest == "bbb2222"
+    and by.plugin.latestAsset == "#bbb222222222")
   check("gv lumen unknown (no installed entry)", by.lumen.state == "unknown")
 end
 do
@@ -335,7 +395,9 @@ do
 end
 
 do
-  -- GitHub can be down while the commit-pinned release mirror stays healthy.
+  -- GitHub down while swwayps's mirror is healthy: that mirror tracks
+  -- upstream releases only, so every fork component stays unknown — it must
+  -- NOT serve upstream data as if it were this stack's.
   local http = { get = function(url)
     if url:find("cdn.jsdelivr.net", 1, true) then
       return { status = 200, body = mirror_body }, nil
@@ -351,34 +413,29 @@ do
   })
   local by = {}
   for _, c in ipairs(res.components) do by[c.key] = c end
-  check("gv GitHub-down uses mirrored slsteam release",
-    by.slsteam_moon.latest == "v2.9" and by.slsteam_moon.state == "update")
-  check("gv GitHub-down uses mirrored plugin release",
-    by.plugin.latest == "v2.9" and by.plugin.state == "update")
-  check("gv GitHub-down uses mirrored Lumen release",
-    by.lumen.latest == "v2.9" and by.lumen.state == "update")
+  check("gv GitHub-down sls stays unknown (upstream mirror is not ours)",
+    by.slsteam_moon.state == "unknown")
+  check("gv GitHub-down plugin stays unknown", by.plugin.state == "unknown")
+  check("gv GitHub-down lumen stays unknown", by.lumen.state == "unknown")
 end
 
 do
-  -- Only Lumen publishes a beta artifact. A legacy mixed preference becomes
-  -- global Beta, while components without a Beta artifact remain effectively
-  -- Stable through the existing fallback.
-  local function release_body(url)
-    local name = url:find("/lumen/", 1, true) and "lumen-linux.zip"
-      or url:find("luatools-moon", 1, true) and "luatools-linux.zip"
-      or "slsteam-moon-linux-2.7-lumen.zip"
-    return '{"tag_name":"v2.7","assets":[{"name":"' .. name ..
-      '","id":700,"created_at":"2026-07-15T00:00:00Z","size":100}]} '
+  -- The forks publish no beta artifacts (no beta branches with dist assets),
+  -- so a stale requested-beta preference falls back to Stable everywhere and
+  -- the per-component beta state mirrors the stable state.
+  local commit_body = function(sha)
+    return '{"sha":"' .. sha .. '","commit":{"committer":{"date":"2026-07-15T00:00:00Z"}}}'
   end
   local http = { get = function(url)
     if url:find("/contents/", 1, true) then
-      if url:find("/swwayps/lumen/", 1, true) then
-        return { status = 200, body =
-          '{"sha":"beta-lumen-sha","size":200,"download_url":"https://raw/beta"}' }
-      end
       return { status = 404, body = "{}" }
     end
-    return { status = 200, body = release_body(url) }
+    if url:find("/commits/", 1, true) then
+      return { status = 200, body = commit_body("ccc3333333333333333333333333333333333333") }, nil
+    end
+    return { status = 200, body =
+      '{"tag_name":"v20261120203232","assets":[{"name":"SLSsteam.so","id":700,' ..
+      '"created_at":"2026-11-20T20:32:32Z","size":17312520}]}' }, nil
   end }
   local res = about.get_versions({
     http = http,
@@ -388,28 +445,19 @@ do
       if path == "/channels" then
         return '{"slsteam_moon":"beta","plugin":"stable","lumen":"beta"}'
       end
-      return '{"lumen":{"tag":"v2.7","id":700,"channel":"stable"}}'
+      return '{"lumen":{"tag":"ccc3333","id":"ccc3333333333333333333333333333333333333"}}'
     end,
   })
   local by = {}
   for _, c in ipairs(res.components) do by[c.key] = c end
   check("gv exposes requested global channel", res.channel == "beta")
-  check("gv beta available only for Lumen", by.lumen.betaAvailable == true
+  check("gv no beta artifacts on the forks", by.lumen.betaAvailable == false
     and by.slsteam_moon.betaAvailable == false and by.plugin.betaAvailable == false)
-  check("gv selected Lumen beta", by.lumen.channel == "beta"
-    and by.lumen.latest == "beta" and by.lumen.latestAsset:find("beta%-lumen") ~= nil)
-  check("gv exposes instant Stable/Beta states",
-    type(by.lumen.channelStates) == "table"
-      and by.lumen.channelStates.stable == "current"
-      and by.lumen.channelStates.beta == "update")
-  check("gv Beta fallback reuses Stable state",
-    type(by.slsteam_moon.channelStates) == "table"
-      and type(by.plugin.channelStates) == "table"
-      and by.slsteam_moon.channelStates.beta == by.slsteam_moon.channelStates.stable
-      and by.plugin.channelStates.beta == by.plugin.channelStates.stable)
-  check("gv stable fallback when selected beta unavailable",
-    by.slsteam_moon.channel == "stable" and by.slsteam_moon.latest == "v2.7")
-  check("gv stable install differs from selected beta", by.lumen.state == "update")
+  check("gv beta request falls back to stable", by.lumen.channel == "stable"
+    and by.slsteam_moon.channel == "stable" and by.plugin.channel == "stable")
+  check("gv beta state mirrors stable",
+    by.lumen.channelStates.beta == by.lumen.channelStates.stable)
+  check("gv lumen current on the branch commit", by.lumen.state == "current")
 end
 
 -- ── terminal detection + command building ────────────────────────────────────
@@ -441,26 +489,30 @@ do
   check("script has installer url", s:find(about.INSTALL_URL, 1, true) ~= nil)
   check("script pauses", s:find("Press Enter", 1, true) ~= nil)
   check("script no flag by default", s:find("%-s %-%- ") == nil)
+  check("script tells how to activate the staged SLSsteam",
+    s:find("moon64 on", 1, true) ~= nil)
 end
 
 
--- ── unified component channel flags ─────────────────────────────────────────
-local flags_ready = type(about.channel_flags) == "function"
-check("exports channel flags", flags_ready)
+-- ── moon64 update flags ──────────────────────────────────────────────
+local flags_ready = type(about.update_flags) == "function"
+  and type(about.cloudredirect_installed) == "function"
+check("exports moon64 update flags", flags_ready)
 if flags_ready then
-  local flags = about.channel_flags({
-    slsteam_moon = "stable", plugin = "beta", lumen = "beta",
-  }, false)
-  check("channel flags use one global beta", table.concat(flags, " ") ==
-    "--slsteam-channel beta --plugin-channel beta --lumen-channel beta")
-  local np = about.channel_flags({
-    slsteam_moon = "beta", plugin = "beta", lumen = "stable",
-  }, true)
-  check("noplugin keeps global beta", table.concat(np, " ") ==
-    "--slsteam-channel beta --lumen-channel beta --noplugin")
-  local script = about.update_script(about.INSTALL_URL, flags)
-  check("update script forwards the global channel", script:find(
-    "| bash %-s %-%- %-%-slsteam%-channel beta %-%-plugin%-channel beta %-%-lumen%-channel beta") ~= nil)
+  check("flags: lumen patch without CloudRedirect",
+    table.concat(about.update_flags(false), " ") == "--with-lumen-patch")
+  check("flags: cloudredirect when installed",
+    table.concat(about.update_flags(true), " ") ==
+      "--with-lumen-patch --with-cloudredirect")
+  local script = about.update_script(about.INSTALL_URL, about.update_flags(true))
+  check("update script forwards the flags", script:find(
+    "| bash %-s %-%- %-%-with%-lumen%-patch %-%-with%-cloudredirect") ~= nil)
+  check("cr detection sees the hook",
+    about.cloudredirect_installed("/h", function(p)
+      return p == "/h/.local/share/CloudRedirect/cloud_redirect.so"
+    end) == true)
+  check("cr detection absent -> false",
+    about.cloudredirect_installed("/h", function() return false end) == false)
 end
 
 -- ── channel RPC registration ────────────────────────────────────────────────
@@ -503,11 +555,12 @@ end
 do
   local gets = 0
   local function api_body(url)
-    local name = url:find("lumen", 1, true) and "lumen-linux.zip"
-      or url:find("luatools-moon", 1, true) and "luatools-linux.zip"
-      or "slsteam-moon-linux-2.6-lumen.zip"
-    return '{"tag_name":"v2.6","assets":[{"name":"' .. name ..
-      '","id":100,"created_at":"2026-06-21T03:15:25Z","size":100}]}'
+    if url:find("/commits/", 1, true) then
+      return '{"sha":"aaa1111111111111111111111111111111111111",' ..
+        '"commit":{"committer":{"date":"2026-06-21T03:15:25Z"}}}'
+    end
+    return '{"tag_name":"v20261120203232","assets":[{"name":"SLSsteam.so","id":100,' ..
+      '"created_at":"2026-06-21T03:15:25Z","size":100}]}'
   end
   local http = { get = function(url)
     gets = gets + 1
