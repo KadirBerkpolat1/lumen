@@ -356,9 +356,15 @@
   }
 
   function luaToolsCompleteFix(appid, fix, context) {
-    return call("GetFixLaunchOptions", {
-      appid: Number(appid), compatToolName: "", currentLaunchOptions: "",
-      installPath: context.installPath || "", contentScriptQuery: "",
+    // A Windows online fix also needs its AppID swapped at the client layer, or
+    // its lobby is refused; a swap that fails must not fail the install.
+    return call("LumenSyncFixAppId", {
+      appid: Number(appid), installPath: context.installPath || "", contentScriptQuery: "",
+    }).catch(function () { return null; }).then(function () {
+      return call("GetFixLaunchOptions", {
+        appid: Number(appid), compatToolName: "", currentLaunchOptions: "",
+        installPath: context.installPath || "", contentScriptQuery: "",
+      });
     }).then(luaToolsParse).then(function (options) {
       if (!(options && options.success)) throw new Error("launch options unavailable");
       if (!(options.apply && options.launchOptions)) return true;

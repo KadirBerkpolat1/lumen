@@ -299,6 +299,15 @@ const BASE = {
   GetFixLaunchOptions: () => ({ success: true, apply: false }),
 };
 function calls(fn) { return rpcLog.filter((c) => c.fn === fn); }
+// The AppID swap went out once, for this install, before the fix's receipt
+// closed: an online fix whose game keeps its real AppID has its lobby refused.
+function swapBeforeReceipt(installPath) {
+  const order = rpcLog.map((c) => c.fn);
+  const swap = calls("LumenSyncFixAppId");
+  const receipt = order.indexOf("CompleteLuaToolsFixApply");
+  return swap.length === 1 && swap[0].args.installPath === installPath
+    && receipt !== -1 && order.indexOf("LumenSyncFixAppId") < receipt;
+}
 function overlay() { return document.getElementById("lumen-fixes-overlay"); }
 function tile(label) {
   return document.querySelectorAll(".lumen-fx-tile")
@@ -680,6 +689,8 @@ async function confirmUnfix() {
   eq("finish: a LuaTools fix that completed ends ok, titled with its name, without a note",
     ended(finished(), "ok") && finished().title === window.__lumenFixesFill(S.appliedOk, { fix: "FreeTP Online" })
       && finished().text === S.appliedDetail && !finished().note, true);
+  eq("finish: a LuaTools fix maps its AppID before its receipt closes",
+    swapBeforeReceipt("/games/G"), true);
 
   await luaTools([{ status: "done" }], { success: false, error: "receipt not closed" });
   await settle(60);
@@ -953,6 +964,41 @@ async function confirmUnfix() {
   eq("fresh: a failed lookup leaves the tiles alone",
     !tile(S.fallbackOnlineLabel).querySelector(".lumen-fx-fresh")
       && !tile(S.freetpLabel).querySelector(".lumen-fx-fresh"), true);
+
+  // ── Settings > Fixes catalogue: Apply on a game's fix card ────────────────
+  const fromCatalogue = async (extra) => {
+    const o = overlay();
+    if (o) o.remove();
+    window.__lumenCloseOverlay();
+    await settle(4);
+    rpcLog.length = 0;
+    handlers = Object.assign({}, BASE, {
+      GetLuaToolsAuthStatus: () => ({ success: true, configured: true, account: { displayName: "u" } }),
+      GetLuaToolsFixesCatalogue: () => ({ success: true, authRequired: false, tags: [],
+        games: [{ appid: "322330", name: "Game", fixCount: 1, tags: [] }] }),
+      GetLuaToolsFixesForGame: () => ({ success: true, name: "Game", fixes: [{ id: "online-fix:a1",
+        title: "Online Fix", category: "online_fix", hasFix: true, hasManifest: false,
+        tags: [{ name: "Online Fix", slug: "online-fix" }] }] }),
+      StartLuaToolsFix: () => ({ success: true }),
+      GetApplyFixStatus: () => ({ success: true, state: { status: "done" } }),
+      CompleteLuaToolsFixApply: () => ({ success: true }),
+    }, extra);
+    window.__lumenOpenOverlay();
+    await settle();
+    document.querySelectorAll(".lumen-tab").find((t) => t.lastChild.textContent === "Fixes").click();
+    await settle();
+    document.querySelector(".lumen-fixes-game").click();
+    await settle();
+    document.querySelector(".lumen-fixes-fix-actions button").click();
+    await settle(60);
+  };
+  await fromCatalogue({ LumenSyncFixAppId: () => ({ success: true, applied: true, fakeAppId: 480 }) });
+  eq("catalogue: an online fix applied from Settings maps its AppID before its receipt closes",
+    swapBeforeReceipt("/games/G") && calls("LumenSyncFixAppId")[0].args.appid === 322330, true);
+
+  await fromCatalogue({ LumenSyncFixAppId: () => { throw new Error("not_installed"); } });
+  eq("catalogue: a failed AppID swap still closes the fix's receipt",
+    calls("CompleteLuaToolsFixApply").length === 1, true);
 
   if (failures) { console.error("\n" + failures + " failed"); process.exit(1); }
   console.log("\nall ok");
