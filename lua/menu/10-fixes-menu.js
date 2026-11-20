@@ -41,8 +41,13 @@
   var FX_FALLBACK_RECEIPT_KIND = "online_fix_fallback";
   // LumenDownloadFreeTPFix error codes that mean freetp.org has no fix for the
   // game; "site_blocked" means the site refused this connection (HTTP 403/451),
+  // "browser_required" that the file waits behind the site's browser check;
   // every other code is a site or download failure.
   var FX_FREETP_NOT_FOUND = { invalid_appid: true, no_name: true, no_page: true, no_fix_file: true };
+  // The file a gated FreeTP page downloads (LumenFindFreeTPDownload) is looked
+  // for every FX_FREETP_WAIT_MS, for at most FX_FREETP_WAIT_POLLS polls.
+  var FX_FREETP_WAIT_MS = 2000;
+  var FX_FREETP_WAIT_POLLS = 300;
 
   // The icon cluster we tightened (see ensureFixesButton): keep a handle + its
   // original left margin so removing the entry restores Steam's spacing.
@@ -1355,8 +1360,8 @@
 
   // Transient busy overlay inside the window (keeps the tiles intact underneath).
   // Returns the function that closes it; its .say(text) changes the message,
-  // and onCancel adds a Cancel button.
-  function fxBusy(win, msg, onCancel) {
+  // actions ([{ label, onClick }]) add links and onCancel adds a Cancel button.
+  function fxBusy(win, msg, onCancel, actions) {
     var b = document.createElement("div");
     b.style.cssText = "position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;" +
       "justify-content:center;gap:14px;background:rgba(35,38,45,.9);z-index:5;color:#dcdedf;" +
@@ -1364,6 +1369,14 @@
     b.innerHTML = '<div class="lumen-fx-spin"></div><div></div>';
     var text = b.lastChild;
     text.textContent = msg;
+    (actions || []).forEach(function (action) {
+      var a = document.createElement("a");
+      a.href = "#";
+      a.className = "lumen-fx-btn secondary";
+      a.textContent = action.label;
+      a.addEventListener("click", function (e) { e.preventDefault(); action.onClick(); });
+      b.appendChild(a);
+    });
     if (onCancel) {
       var c = document.createElement("a");
       c.href = "#";
@@ -1528,6 +1541,13 @@
         var onPending = function () { done.say(S.freetpDownloading); };
         return fxDownloadFreeTP(appid, gameName, win, onPending).then(function (dl) {
           if (dl && dl.pending) return function () {};
+          if (dl && dl.errorCode === "browser_required" && dl.pageUrl) {
+            return function () {
+              fxWaitFreeTPBrowser(win, appid, ctx, gameName, dl, function (why) {
+                pickerOr(why).then(function (show) { if (win.isConnected) show(); });
+              });
+            };
+          }
           if (!(dl && dl.success && dl.path)) {
             return pickerOr(fixesFreeTPFailText(S, dl));
           }
@@ -1563,6 +1583,52 @@
         return fxDownloadFreeTP(appid, gameName, win, onPending);
       });
     });
+  }
+
+  // freetp.org hands a fix only to a browser that passed its check (Cloudflare
+  // Turnstile, then a countdown), so the getfile page opens in the user's
+  // browser and the file is installed once it is in the downloads folder,
+  // named for the game, with a size that held still between two polls. The
+  // wait ends with the menu, Cancel, "choose the file myself" or
+  // FX_FREETP_WAIT_POLLS; the last two fall back to the archive picker.
+  function fxWaitFreeTPBrowser(win, appid, ctx, gameName, dl, showPicker) {
+    var S = fxStrings();
+    var stopped = false, polls = 0, last = null, done = null;
+    var stop = function () { stopped = true; if (done) done(); };
+    // Steam's own handler raises the browser (a backend xdg-open cannot under
+    // Wayland); the plugin's opener is the fallback.
+    var open = function () {
+      var fallback = function () {
+        call("OpenExternalUrl", { url: dl.pageUrl, contentScriptQuery: "" }).catch(function () {});
+      };
+      call("__lumenOpenExternalUrl", { url: dl.pageUrl }).then(fxParse).then(function (r) {
+        if (!(r && r.ok)) fallback();
+      }).catch(fallback);
+    };
+    done = fxBusy(win, fixesFill(S.freetpBrowserWait, { wait: dl.wait || 30 }), stop, [
+      { label: S.freetpBrowserReopen, onClick: open },
+      { label: S.freetpBrowserPick, onClick: function () { stop(); showPicker(S.freetpBrowserNone); } },
+    ]);
+    var poll = function () {
+      if (stopped) return;
+      if (!win.isConnected) { stopped = true; return; }
+      if (++polls > FX_FREETP_WAIT_POLLS) { stop(); showPicker(S.freetpBrowserNone); return; }
+      call("LumenFindFreeTPDownload", {
+        appid: appid, contentScriptQuery: "", gameName: gameName || "", since: dl.since || 0,
+      }).then(fxParse).then(function (found) {
+        if (stopped) return;
+        var file = found && found.success && found.found ? found : null;
+        if (file && last && file.path === last.path && file.size === last.size) {
+          stop();
+          fxInstallArchive(win, appid, ctx, { name: file.name, path: file.path });
+          return;
+        }
+        last = file;
+        setTimeout(poll, FX_FREETP_WAIT_MS);
+      }).catch(function () { if (!stopped) setTimeout(poll, FX_FREETP_WAIT_MS); });
+    };
+    open();
+    setTimeout(poll, FX_FREETP_WAIT_MS);
   }
 
   // EOS / Epic Fix — an emulator fix already in the game folder gets its launch

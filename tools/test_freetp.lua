@@ -308,12 +308,12 @@ check("download: full chain succeeds", dl.success == true
   and dl.path == "/tmp/ftdl/4312190-freetp-fix.exe"
   and #written == 1 and written[1].size == 102)
 check("download: the attachment page is sent as Referer",
-  #calls == 3 and calls[3].url == "https://freetp.org/index.php?do=download&id=20665"
-    and type(calls[3].opts) == "table"
-    and calls[3].opts.headers.Referer == "https://freetp.org/getfile-20665")
+  #calls == 4 and calls[4].url == "https://freetp.org/index.php?do=download&id=20665"
+    and type(calls[4].opts) == "table"
+    and calls[4].opts.headers.Referer == "https://freetp.org/getfile-20665")
 check("download: the file fetch gets minutes, not the blocking request cap, and a size cap",
-  calls[3].opts.timeout == ft.DOWNLOAD_TIMEOUT and ft.DOWNLOAD_TIMEOUT > 30
-    and calls[3].opts.max_bytes == ft.MAX_FIX_BYTES)
+  calls[4].opts.timeout == ft.DOWNLOAD_TIMEOUT and ft.DOWNLOAD_TIMEOUT > 30
+    and calls[4].opts.max_bytes == ft.MAX_FIX_BYTES)
 
 local dl_noexe = download_fix(4312190, "CRACK", {
   get = (fake_chain({ article = DISCORD_ONLY_PAGE_HTML })),
@@ -630,6 +630,72 @@ check("resolve: the page's update marker rides along at no extra cost",
   r_upd.errorCode == nil and r_upd.updated ~= nil
   and os.date("%Y-%m-%d", r_upd.updated) == "2024-12-03"
   and r_upd.updatedNote == "новый клиент и патч")
+
+-- ── download gate (freetp.org since 2026-11: Turnstile check + countdown) ──
+-- Verbatim shape of getfile-20913 on 2026-11-20; do=download without the
+-- gate's one-time token answered HTTP 403 "Доступ ограничен".
+local GATED_GETFILE_HTML = [==[<div class="dl-box"><span class="dl-counter"></span>
+<script type="application/json" id="freetp-download-gate">{"nonce":"d08ee3b14dd3fcc3cb70ed39bdf5372a7568df8d101d2db3","wait":30,"sitekey":"0x4AAAAAAFnrtTMp3fTnkBX5","endpoint":"\/index.php?controller=ajax\u0026mod=freetp_download_gate"}</script>
+<script src="/public/freetp_download/gate.js?v=1.3.4" type="bffb1f2ab0fe5b003d1941b4-text/javascript"></script></div>]==]
+check("gate: a gated getfile page carries its countdown",
+  (ft.download_gate(GATED_GETFILE_HTML) or {}).wait == 30)
+check("gate: a page without the gate, or no page, is not gated",
+  ft.download_gate(GETFILE_PAGE_HTML) == nil and ft.download_gate(nil) == nil)
+
+do
+  local gated = { status = 200, body = GATED_GETFILE_HTML }
+  local at = function() return 1795000000 end
+  local dl_gated = download_fix(4312190, "CRACK", {
+    get = (fake_chain({ article = GETFILE_PAGE_HTML, download = gated })), clock = at,
+    dl_dir = "/tmp/ftdl", mkdir = function() return true end, write_file = function() return true end,
+  })
+  check("gate: a gated fix goes to the browser: its getfile page, the countdown, the clock",
+    dl_gated.success == false and dl_gated.errorCode == "browser_required"
+      and dl_gated.pageUrl == "https://freetp.org/getfile-20665" and dl_gated.wait == 30
+      and dl_gated.since == 1795000000)
+
+  local greg = {}
+  ft.register(greg, as_job({ get = (fake_chain({ article = GETFILE_PAGE_HTML, download = gated })),
+    clock = at }))
+  local dec_gated = require("json").decode(greg.LumenDownloadFreeTPFix(4312190, "", "CRACK"))
+  check("register: the RPC answer keeps browser_required, the page and the clock",
+    dec_gated.errorCode == "browser_required"
+      and dec_gated.pageUrl == "https://freetp.org/getfile-20665" and dec_gated.since == 1795000000)
+end
+
+-- ── the browser's download, matched to the game ──────────────────────────────────
+-- File names as freetp.org and online-fix.me downloads land in a downloads
+-- folder (2026-11).
+local DL = {
+  { name = "Satisfactory-Multiplayer-Fix-Online-v5.exe", path = "/d/a.exe", size = 2126435, ctime = 100 },
+  { name = "Slime-Rancher-2-Multiplayer-Fix-Online.exe", path = "/d/b.exe", size = 16867407, ctime = 200 },
+  { name = "SlimeRancher2_Fix_Repair_Steam_Generic.rar", path = "/d/c.rar", size = 34233022, ctime = 150 },
+}
+check("match: the newest download named for the game",
+  (ft.match_download(DL, "Slime Rancher 2") or {}).name == "Slime-Rancher-2-Multiplayer-Fix-Online.exe")
+check("match: another game's download is never taken",
+  (ft.match_download(DL, "Satisfactory") or {}).path == "/d/a.exe"
+    and ft.match_download(DL, "R.E.P.O.") == nil)
+check("match: an empty file (a download not finished yet) is skipped",
+  ft.match_download({ { name = "REPO-Multiplayer-Fix-Online.exe", path = "/d/r.exe", size = 0,
+    ctime = 300 } }, "R.E.P.O.") == nil)
+check("match: a name without a Latin word matches nothing", ft.match_download(DL, "Ведьмак") == nil)
+
+do
+  local freg = {}
+  ft.register(freg, { home = "/home/u", downloads_dir = "/home/u/İndirilenler",
+    read_pipe = function()
+      return "16867407|1795000100.25|/home/u/İndirilenler/Slime-Rancher-2-Multiplayer-Fix-Online.exe\n"
+        .. "34233022|1794990000.00|/home/u/İndirilenler/SlimeRancher2_Fix_Repair_Steam_Generic.rar\n"
+    end })
+  local json = require("json")
+  local found = json.decode(freg.LumenFindFreeTPDownload(1657630, "", "Slime Rancher 2", 1795000000))
+  check("find: the download that appeared after the page opened, by its status-change time",
+    found.success == true and found.found == true and found.size == 16867407
+      and found.path == "/home/u/İndirilenler/Slime-Rancher-2-Multiplayer-Fix-Online.exe")
+  local none = json.decode(freg.LumenFindFreeTPDownload(1657630, "", "Slime Rancher 2", 1795000200))
+  check("find: nothing new yet answers found = false", none.success == true and none.found == false)
+end
 
 io.write(string.format("\n%d passed, %d failed\n", pass, fail))
 if fail > 0 then os.exit(1) end

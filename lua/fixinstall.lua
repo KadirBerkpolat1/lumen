@@ -324,27 +324,66 @@ function fixinstall.find_inno()
   return first_bin({ "innoextract" })
 end
 
+-- download_dirs(home, deps) -> the user's real downloads directories:
+-- deps.downloads_dir when given, else xdg-user-dir DOWNLOAD (e.g. Turkish
+-- "İndirilenler") with ~/Downloads as a fallback, both when distinct.
+-- deps.read_line(cmd) -> line is injectable for tests.
+function fixinstall.download_dirs(home, deps)
+  deps = deps or {}
+  if deps.downloads_dir then return { deps.downloads_dir } end
+  local read_line = deps.read_line or popen_line
+  local dirs = {}
+  local xdg = read_line("xdg-user-dir DOWNLOAD 2>/dev/null")
+  if type(xdg) == "string" and xdg:sub(1, 1) == "/" then dirs[#dirs + 1] = xdg end
+  if dirs[1] ~= home .. "/Downloads" then dirs[#dirs + 1] = home .. "/Downloads" end
+  return dirs
+end
+
+-- recent_downloads(home, since, deps) -> { name, path, size, ctime } of the
+-- installable files (zip, rar, 7z, exe) in the downloads directories whose
+-- status-change time is at or after since (epoch seconds). A browser moves a
+-- finished download into place, which sets that time; the modification time
+-- it may copy from the server can be older. deps.read_pipe(cmd) -> text is
+-- injectable for tests.
+function fixinstall.recent_downloads(home, since, deps)
+  deps = deps or {}
+  home = home or os.getenv("HOME") or ""
+  if home == "" then return {} end
+  local read_pipe = deps.read_pipe or popen_read
+  since = tonumber(since) or 0
+  local out = {}
+  for _, dir in ipairs(fixinstall.download_dirs(home, deps)) do
+    local text = read_pipe(
+      "find -- " .. shq(dir) .. " -maxdepth 1 -type f "
+      .. "\\( -iname '*.zip' -o -iname '*.rar' -o -iname '*.7z' "
+      .. "-o -iname '*.exe' \\) "
+      .. "-printf '%s|%C@|%p\\n' 2>/dev/null")
+    if text:sub(-1) ~= "\n" then text = text .. "\n" end
+    for line in text:gmatch("([^\r\n]*)\r?\n") do
+      local size, ctime, path = line:match("^(%d+)%|([%d%.]+)%|(.+)$")
+      ctime = tonumber(ctime)
+      if size and ctime and ctime >= since then
+        out[#out + 1] = {
+          name = path:match("([^/]+)$") or path,
+          path = path,
+          size = tonumber(size) or 0,
+          ctime = math.floor(ctime),
+        }
+      end
+    end
+  end
+  return out
+end
+
 -- list_archives(home, deps) -> recent archives from the user's real
--- downloads directory (xdg-user-dir DOWNLOAD, e.g. Turkish "İndirilenler"),
--- with ~/Downloads as a fallback; both are scanned and merged when distinct.
--- deps.read_pipe(cmd) -> text and deps.downloads_dir (single dir override)
--- are injectable for tests.
+-- downloads directories (download_dirs). deps.read_pipe(cmd) -> text,
+-- deps.read_line and deps.downloads_dir are injectable for tests.
 function fixinstall.list_archives(home, deps)
   deps = deps or {}
   home = home or os.getenv("HOME") or ""
   if home == "" then return {} end
   local read_pipe = deps.read_pipe or popen_read
-  local read_line = deps.read_line or popen_line
-
-  -- The dirs to scan: the explicit override, else xdg DOWNLOAD + ~/Downloads.
-  local dirs = {}
-  if deps.downloads_dir then
-    dirs[#dirs + 1] = deps.downloads_dir
-  else
-    local xdg = read_line("xdg-user-dir DOWNLOAD 2>/dev/null")
-    if type(xdg) == "string" and xdg:sub(1, 1) == "/" then dirs[#dirs + 1] = xdg end
-    if dirs[1] ~= home .. "/Downloads" then dirs[#dirs + 1] = home .. "/Downloads" end
-  end
+  local dirs = fixinstall.download_dirs(home, deps)
 
   local entries = {}
   for _, dir in ipairs(dirs) do

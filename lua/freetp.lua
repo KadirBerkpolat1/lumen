@@ -4,10 +4,12 @@
 -- (over the network) category and hosts the fix as an on-site attachment
 -- (getfile-XXXX). The chain: DLE search -> the game's article -> its fix
 -- attachment (setup .exe or archive; full-game .torrent repacks and game
--- update setups are skipped) -> index.php?do=download&id=XXXX with the
--- getfile page as Referer, fetched in the background -> file signature
--- check. The frontend then installs the file
--- through fixinstall, recorded, so Unfix can revert it.
+-- update setups are skipped) -> its getfile page -> index.php?do=download&id=XXXX
+-- with the getfile page as Referer, fetched in the background -> file
+-- signature check. The frontend then installs the file through fixinstall,
+-- recorded, so Unfix can revert it. A getfile page that holds the file behind
+-- freetp.org's browser check (download_gate) is opened in the user's browser
+-- instead, and the frontend picks the download up from the downloads folder.
 --
 -- DLE search answers a plain GET (index.php?do=search&subaction=search&story=),
 -- so resolution costs a few small requests at click time — no crawl of the
@@ -252,6 +254,17 @@ function freetp.parse_page_updated(html)
   return res
 end
 
+-- download_gate(html) -> { wait } when a getfile page holds its file behind
+-- freetp.org's browser check (gate.js: a Cloudflare Turnstile token and a
+-- countdown of wait seconds, then a one-time do=download link; without the
+-- token do=download answers 403), else nil. PURE.
+function freetp.download_gate(html)
+  if type(html) ~= "string" then return nil end
+  local data = html:match('id="freetp%-download%-gate"[^>]*>(.-)</script>')
+  if not data then return nil end
+  return { wait = tonumber(data:match('"wait"%s*:%s*(%d+)')) or 0 }
+end
+
 -- fix_revision(label) -> the fix revision a getfile label carries
 -- ("…Multiplayer Fix Online-v3" -> "3", "…Fix-Online-v1.5" -> "1.5"), or
 -- nil. It numbers the FIX, not the game build: a repack's "_v2243" or an
@@ -321,6 +334,25 @@ function freetp.pick_fix_file(files)
   return best
 end
 
+-- match_download(entries, game_name) -> the newest of the entries
+-- (fixinstall.recent_downloads) whose file name holds the game's name, after
+-- normalize ("Slime-Rancher-2-Multiplayer-Fix-Online.exe" for "Slime Rancher
+-- 2"), or nil. An empty file (a download the browser has not finished) never
+-- matches, nor does anything for a name without a Latin word. PURE.
+function freetp.match_download(entries, game_name)
+  local target = freetp.normalize(game_name)
+  if target == "" then return nil end
+  local best
+  for _, e in ipairs(type(entries) == "table" and entries or {}) do
+    if type(e) == "table" and (tonumber(e.size) or 0) > 0
+        and freetp.normalize(e.name):find(target, 1, true)
+        and (not best or (tonumber(e.ctime) or 0) > (tonumber(best.ctime) or 0)) then
+      best = e
+    end
+  end
+  return best
+end
+
 -- The download dir (fixinstall's, which install empties), or nil without HOME.
 local function download_dir(deps)
   if deps.dl_dir then return deps.dl_dir end
@@ -340,8 +372,11 @@ end
 -- its fix file (a few small blocking requests), then start fetching
 -- /index.php?do=download&id=<id> with the getfile page as Referer in the
 -- background; poll_download advances the job. A job that failed before the
--- fetch carries its result already. deps: get / start / poll / write_file /
--- mkdir / dl_dir / clock, injectable for tests.
+-- fetch carries its result already; so does a gated file (download_gate):
+-- browser_required with the getfile page to open, the countdown and the
+-- backend clock it was answered at (the since of LumenFindFreeTPDownload).
+-- deps: get / start / poll / write_file / mkdir / dl_dir / clock, injectable
+-- for tests.
 function freetp.start_download(appid, game_name, deps)
   deps = deps or {}
   local job = {}
@@ -361,6 +396,18 @@ function freetp.start_download(appid, game_name, deps)
   end
   local pick = freetp.pick_fix_file(resolved.files)
   if not pick then return fail("no_fix_file") end
+  local ok_page, page = pcall(get, pick.url, { timeout = 6, max_bytes = freetp.PAGE_MAX_BYTES,
+    headers = { ["Referer"] = resolved.article } })
+  if ok_page and type(page) == "table" and page.status == 200 then
+    local gate = freetp.download_gate(page.body)
+    if gate then
+      job.result = { success = false, errorCode = "browser_required", pageUrl = pick.url,
+        wait = gate.wait, since = (deps.clock or os.time)() }
+      return job
+    end
+  elseif ok_page and type(page) == "table" and freetp.BLOCKED_STATUS[page.status] then
+    return fail("site_blocked", page.status, resolved.article)
+  end
   local ok, handle = pcall(start, freetp.BASE_URL
     .. "/index.php?do=download&id=" .. freetp.urlencode(pick.id), {
     headers = { ["Referer"] = pick.url },
@@ -475,15 +522,16 @@ function freetp.discard_download(appid, deps)
   end
 end
 
--- register(registry, deps): install LumenDownloadFreeTPFix and
--- LumenDiscardFreeTPDownload, wrapping the table-returning cores in JSON
--- encoding (the dispatch contract). `deps` is passed straight to the cores —
--- inject it from tests; production leaves it nil so it uses the Lumen http
--- client. LumenDownloadFreeTPFix starts a download job on the first call and
--- advances it on each later call for the same appid, answering
--- { success = true, pending = true } until it has the result; the frontend
--- polls it. The bridge passes {appid, contentScriptQuery, gameName}
--- alphabetically positional; the table form is tolerated too.
+-- register(registry, deps): install LumenDownloadFreeTPFix,
+-- LumenDiscardFreeTPDownload and LumenFindFreeTPDownload, wrapping the
+-- table-returning cores in JSON encoding (the dispatch contract). `deps` is
+-- passed straight to the cores — inject it from tests; production leaves it
+-- nil so it uses the Lumen http client. LumenDownloadFreeTPFix starts a
+-- download job on the first call and advances it on each later call for the
+-- same appid, answering { success = true, pending = true } until it has the
+-- result; the frontend polls it. The bridge passes {appid,
+-- contentScriptQuery, gameName} alphabetically positional; the table form is
+-- tolerated too.
 function freetp.register(registry, deps)
   local json = require("json")
   local clock = (deps and deps.clock) or os.time
@@ -520,6 +568,22 @@ function freetp.register(registry, deps)
     if key then jobs[key] = nil end
     local ok, err = pcall(freetp.discard_download, appid, deps)
     return json.encode(ok and { success = true } or { success = false, error = tostring(err) })
+  end
+  -- {appid, contentScriptQuery, gameName, since} sorted: the file the browser
+  -- downloaded from a gated fix page (match_download over the downloads that
+  -- appeared since the page was opened), { found = false } until it is there.
+  registry.LumenFindFreeTPDownload = function(appid, contentScriptQuery, gameName, since)
+    if type(appid) == "table" then
+      gameName, since = appid.gameName, appid.since
+    end
+    local ok, res = pcall(function()
+      local home = (deps and deps.home) or os.getenv("HOME") or ""
+      local hit = freetp.match_download(
+        require("fixinstall").recent_downloads(home, since, deps), gameName)
+      if not hit then return { success = true, found = false } end
+      return { success = true, found = true, name = hit.name, path = hit.path, size = hit.size }
+    end)
+    return json.encode(ok and res or { success = false, error = tostring(res) })
   end
   return registry
 end

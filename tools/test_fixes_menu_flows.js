@@ -666,6 +666,58 @@ async function confirmUnfix() {
   eq("finish: a fix lua.tools already applied ends ok once its launch options are set",
     ended(finished(), "ok") && finished().title === S.launchSetTitle && !finished().note, true);
 
+  // ── FreeTP: a gated download goes through the user's browser ─────────────
+  const GATED = { success: false, errorCode: "browser_required",
+    pageUrl: "https://freetp.org/getfile-20914", wait: 30, since: 1795000000 };
+  const NONE = { success: true, found: false };
+  const fileOf = (size) => ({ success: true, found: true, name: "Game-Multiplayer-Fix-Online.exe",
+    path: "/home/u/İndirilenler/Game-Multiplayer-Fix-Online.exe", size });
+  const browserFlow = (answers, extra) => {
+    let n = 0;
+    return openMenu(Object.assign({
+      LumenDownloadFreeTPFix: () => GATED,
+      __lumenOpenExternalUrl: () => ({ ok: true }),
+      LumenFindFreeTPDownload: () => answers[Math.min(n++, answers.length - 1)],
+      LumenInstallFixArchive: () => ({ success: true, added: 2, replaced: 0 }),
+      LumenListFixArchives: () => ({ success: true, archives: [] }),
+    }, extra)).then(() => tile(S.freetpLabel).click());
+  };
+  const waitLink = (label) => document.querySelectorAll(".lumen-fx-btn.secondary")
+    .find((a) => a.textContent === label);
+
+  await browserFlow([NONE, fileOf(5), fileOf(9), fileOf(9)]);
+  await settle(80);
+  eq("browser: a gated FreeTP fix opens its getfile page in the browser",
+    calls("__lumenOpenExternalUrl").length === 1
+      && calls("__lumenOpenExternalUrl")[0].args.url === GATED.pageUrl, true);
+  eq("browser: the download is looked for since the page opened, by the game's name",
+    calls("LumenFindFreeTPDownload").length > 0 && calls("LumenFindFreeTPDownload")
+      .every((c) => c.args.since === GATED.since && c.args.gameName === "Game"), true);
+  eq("browser: a file still growing is installed once, after its size held still",
+    calls("LumenInstallFixArchive").length === 1
+      && calls("LumenInstallFixArchive")[0].args.archivePath === fileOf(9).path
+      && calls("LumenFindFreeTPDownload").length === 4 && ended(finished(), "ok"), true);
+
+  let appear = false;
+  await browserFlow([], { LumenFindFreeTPDownload: () => (appear ? fileOf(9) : NONE) });
+  await settle(6);
+  waitLink(S.cancel).click();
+  const findsAtCancel = calls("LumenFindFreeTPDownload").length;
+  appear = true;
+  await settle(40);
+  eq("browser: Cancel ends the wait: no more lookups, nothing installed",
+    calls("LumenFindFreeTPDownload").length === findsAtCancel
+      && calls("LumenInstallFixArchive").length === 0, true);
+
+  await browserFlow([NONE], { LumenListFixArchives: () => ({ success: true, archives: [
+    { name: "Game-Fix.zip", path: "/home/u/Downloads/Game-Fix.zip", size: 10, mtime: 1 }] }) });
+  await settle(6);
+  waitLink(S.freetpBrowserPick).click();
+  await settle(10);
+  eq("browser: choosing the file myself ends the wait in the archive picker",
+    document.querySelectorAll(".lumen-fx-arch").length === 1
+      && calls("LumenInstallFixArchive").length === 0, true);
+
   // ── LuaTools fix (fxPoll): running, done, failed, cancelled ──────────────
   const luaTools = (statuses, complete) => {
     let n = 0;
