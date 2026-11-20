@@ -1660,9 +1660,68 @@
       });
       wrap.appendChild(row);
     });
+
+    var dz = document.createElement("div");
+    dz.className = "lumen-fx-dropzone";
+    var dzText = document.createElement("div");
+    dzText.className = "lumen-fx-dropzone-text";
+    dzText.textContent = S.dropHint || "Drop a local fix archive/folder here, or choose one below:";
+    var dzActions = document.createElement("div");
+    dzActions.className = "lumen-fx-dropzone-actions";
+
+    var pickFileBtn = document.createElement("button");
+    pickFileBtn.type = "button";
+    pickFileBtn.className = "lumen-account-button";
+    pickFileBtn.textContent = S.pickArchive || "Browse Archive\u2026";
+    pickFileBtn.addEventListener("click", function () {
+      pickFileBtn.disabled = true;
+      call("LumenPickFixSource", { initialPath: "" }).then(fxParse).then(function (p) {
+        pickFileBtn.disabled = false;
+        if (p && p.success && !p.cancelled && p.path) {
+          fxInstallArchive(win, appid, ctx, { name: p.name || p.path, path: p.path });
+        }
+      }).catch(function () { pickFileBtn.disabled = false; });
+    });
+
+    var pickDirBtn = document.createElement("button");
+    pickDirBtn.type = "button";
+    pickDirBtn.className = "lumen-account-button";
+    pickDirBtn.textContent = S.pickFolder || "Browse Folder\u2026";
+    pickDirBtn.addEventListener("click", function () {
+      pickDirBtn.disabled = true;
+      call("LumenPickDirectory", { initialPath: "" }).then(fxParse).then(function (p) {
+        pickDirBtn.disabled = false;
+        if (p && p.success && !p.cancelled && p.path) {
+          fxInstallArchive(win, appid, ctx, { name: p.name || p.path, path: p.path });
+        }
+      }).catch(function () { pickDirBtn.disabled = false; });
+    });
+
+    dz.addEventListener("dragover", function (e) {
+      e.preventDefault();
+      dz.classList.add("is-dragover");
+    });
+    dz.addEventListener("dragleave", function () { dz.classList.remove("is-dragover"); });
+    dz.addEventListener("drop", function (e) {
+      e.preventDefault();
+      dz.classList.remove("is-dragover");
+      var files = e.dataTransfer && e.dataTransfer.files;
+      var dropped = files && files[0];
+      var droppedPath = dropped && (dropped.path || dropped.mozFullPath);
+      if (droppedPath) {
+        fxInstallArchive(win, appid, ctx, { name: dropped.name || droppedPath, path: droppedPath });
+      } else {
+        dzText.textContent = S.dropInvalid || "Use Browse Archive or Browse Folder to select a local path.";
+      }
+    });
+
+    dzActions.appendChild(pickFileBtn);
+    dzActions.appendChild(pickDirBtn);
+    dz.appendChild(dzText);
+    dz.appendChild(dzActions);
+    wrap.appendChild(dz);
     body.appendChild(wrap);
   }
-
   // "Online Fix · No login", first choice: online-fix.me's own Steam fix (the
   // Fix Repair archive from the game's public torrent, fetched in the
   // background by aria2c), installed recorded so Unfix reverts it. Anything
@@ -1975,11 +2034,19 @@
                 return;
               }
               if (!r.reverted) { after([optionsNote], leftover); return; }
-              var restoredNote = r.restored ? fixesFill(S.unfixRestoredNote, { restored: r.restored }) : "";
+              var restoredNote = "";
+              if (r.verifiedRestores > 0) {
+                restoredNote = fixesFill(S.unfixVerifiedNote || S.unfixRestoredNote, { restored: r.restored || r.verifiedRestores });
+              } else if (r.restored) {
+                restoredNote = fixesFill(S.unfixRestoredNote, { restored: r.restored });
+              }
+              var checksumNote = r.checksumMismatches > 0
+                ? fixesFill(S.unfixChecksumWarn || "", { count: r.checksumMismatches }) : "";
               if (!r.needsVerify) {
                 after([optionsNote, S.unfixRemovedNote.replace("{removed}", r.removed || 0), restoredNote], leftover);
                 return;
               }
+              if (checksumNote) restoredNote = [restoredNote, checksumNote].filter(Boolean).join(" ");
               // Steam's verify re-downloads changed files: never a surprise.
               var manual = S.unfixVerifyManual.replace("{replaced}", r.replacedCount || 0);
               done();

@@ -37,7 +37,30 @@
   }
 
   function luaToolsStrings() {
-    var pt = pickLang() === "pt-BR";
+    var lang = pickLang();
+    if (lang === "tr") return {
+      fixesTab: "Yamalar", accountTitle: "lua.tools hesabı", signIn: "lua.tools'a giriş yap",
+      unlock: "Yamalar ve Luie'nin kilidini aç", connected: "Bağlı",
+      checking: "Hesabınız kontrol ediliyor\u2026",
+      accountIntro: "Hesabınızı nasıl bağlayacağınızı seçin. Her iki yöntem de aynı güvenli lua.tools oturumunu oluşturur.",
+      discordTitle: "Discord ile devam et", discordBody: "Resmi yetkilendirmeyi Steam'in tarayıcısında açın.",
+      discordButton: "Discord ile giriş yap", codeTitle: "Discord kodu kullan",
+      codeBody: "LuaTools Discord sunucusunda /login komutunu çalıştırın ve 6 karakterli kodu girin.",
+      codePlaceholder: "ABC123", codeButton: "Kod ile giriş yap", waiting: "Discord onayı bekleniyor…",
+      signingIn: "Giriş yapılıyor…", invalidCode: "6 karakterli kodu girin.",
+      clearAfter: "Sonrasında Discord'u Steam'den temizle", clearAfterHint: "Discord oturumunu yalnızca Steam tarayıcısından kapatır. lua.tools oturumunuz bağlı kalır.",
+      clearingDiscord: "Güncelleniyor…", cleared: "Discord oturumu Steam tarayıcısından kapatıldı.",
+      clearFailed: "Discord temizlenemedi. Steam içindeki Discord sayfalarını kapatıp tekrar deneyin.",
+      logout: "lua.tools oturumunu kapat",
+      fixesSearch: "Oyun veya AppID ara", fixesEmpty: "Yama bulunamadı.", all: "Tümü",
+      previous: "Önceki", next: "Sonraki", fixesCount: "yama", back: "Geri",
+      apply: "Uygula", reapply: "Yeniden uygula", applied: "Uygulandı", applyingFix: "Uygulanıyor…",
+      downloadingFix: "İndiriliyor {percent}%", extractingFix: "Çıkarılıyor…",
+      applyDone: "Yama başarıyla uygulandı.", applyFailed: "Yama uygulanamadı.",
+      needsPreparation: "DenuvOwO hazırlığı gerekiyor", needsProton: "Proton gerekiyor",
+      notInstalled: "Oyun yüklü değil", manifest: "Manifest", archive: "Yama dosyaları",
+    };
+    var pt = lang === "pt-BR";
     return pt ? {
       fixesTab: "Fixes", accountTitle: "Conta lua.tools", signIn: "Entrar no lua.tools",
       unlock: "Desbloqueie Fixes e Luie", connected: "Conectado",

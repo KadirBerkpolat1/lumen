@@ -45,6 +45,7 @@ local STEAM_EXE = { steam = true, steamwebhelper = true }
 local STEAM_TREE = {
   "/.steam/", "/.local/share/Steam/", "/ubuntu12_32/", "/ubuntu12_64/",
   "/linux32/", "/linux64/", "/steamapps/",
+  "/steamrt64/", "/steamrt32/", "/Steam/", "/steam/",
 }
 
 -- listener_inodes(text, port) -> array of socket inodes listening on `port`.

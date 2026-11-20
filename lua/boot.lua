@@ -231,6 +231,11 @@ require("slscheck").register(registry)
 -- replaces any plugin-provided RestartSteam implementation.
 require("steamrestart").register(registry)
 
+-- Native Linux folder/archive picker (zenity/kdialog) and MoonTools stack
+-- health diagnostics RPCs. Always registered regardless of plugin mode.
+require("filepicker").register(registry)
+require("stackhealth").register(registry, { no_plugin = not have_plugin })
+
 -- The "Cloud Saves" tab (menu/12-cloud-tab.js): set up CloudRedirect cloud
 -- saves (provider, OAuth sign-in, stats toggles) directly against the hook's
 -- ~/.config/CloudRedirect file contract — no flatpak, no background process.
@@ -267,7 +272,7 @@ local MENU_PARTS = {
   "05-config-tab.js", "06-updates-helpers.js", "07-updates-tab.js",
   "08-about-tab.js", "09-luatools-account.js", "09-overlay.js",
   "10-auto-fix-status.js", "10-fixes-menu.js", "12-cloud-tab.js",
-  "13-sls-check.js", "11-menubar.js",
+  "13-sls-check.js", "14-health-tab.js", "11-menubar.js",
 }
 
 local function read_menu_js()

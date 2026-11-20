@@ -28,11 +28,14 @@ fixinstall.ARCHIVE_PASSWORD = "online-fix.me"
 
 local json = require("json")
 local eosfix = require("eosfix")
+local sha256 = require("sha256")
 
 -- Under a record's folder: the game's own EOS emulator configs an install
--- overwrote, restored on revert.
+-- overwrote, restored on revert, plus SHA-256 verified backups of all
+-- overwritten game files so Un-fix can restore them directly.
 local EOS_BACKUP_DIR = "eos_backup"
-
+local FILE_BACKUP_DIR = "file_backups"
+local FIX_RECORD_FILE = ".luatools-fix/lumen-fix.json"
 -- Single-quote a value for the shell ('' escaping), like the rest of Lumen.
 local function shq(value)
   return "'" .. tostring(value or ""):gsub("'", "'\\''") .. "'"
@@ -221,6 +224,61 @@ local function exists(path)
   local f = io.open(path, "rb")
   if f then f:close() end
   return f ~= nil
+end
+
+local function is_directory(path)
+  if type(path) ~= "string" or path == "" then return false end
+  local ok_lfs, lfs = pcall(require, "lfs")
+  if ok_lfs and type(lfs) == "table" and type(lfs.attributes) == "function" then
+    return lfs.attributes(path, "mode") == "directory"
+  end
+  return os.execute("test -d -- " .. shq(path)) == true
+end
+
+local function hash_file(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local data = f:read("*a")
+  f:close()
+  if data == nil then return nil end
+  return sha256.hex(data)
+end
+
+local function list_directory_entries(dir)
+  local out = {}
+  local ok_lfs, lfs = pcall(require, "lfs")
+  if ok_lfs and type(lfs) == "table" and type(lfs.dir) == "function" then
+    local function walk(abs, rel)
+      local ok_iter, iter, state = pcall(lfs.dir, abs)
+      if not ok_iter then return end
+      for name in iter, state do
+        if name ~= "." and name ~= ".." then
+          local child_abs = abs .. "/" .. name
+          local child_rel = rel ~= "" and (rel .. "/" .. name) or name
+          local attr = lfs.attributes(child_abs)
+          if attr and attr.mode == "directory" then
+            walk(child_abs, child_rel)
+          elseif attr and attr.mode == "file" then
+            out[#out + 1] = { path = child_rel, size = tonumber(attr.size) or 0 }
+          end
+        end
+      end
+    end
+    walk(dir, "")
+  else
+    local p = io.popen("cd " .. shq(dir) .. " && find . -type f -printf '%P\\t%s\\n' 2>/dev/null", "r")
+    if p then
+      for line in p:lines() do
+        local rel, sz = line:match("^([^\t]+)\t(%d+)$")
+        if rel and rel ~= "" then
+          out[#out + 1] = { path = rel, size = tonumber(sz) or 0 }
+        end
+      end
+      p:close()
+    end
+  end
+  table.sort(out, function(a, b) return a.path < b.path end)
+  return fixinstall.safe_entries(out)
 end
 
 -- The LuaTools plugin's 7zz, or "" without the plugin.
@@ -721,21 +779,22 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
     return res
   end
 
-  archive_path = tostring(archive_path or "")
+  archive_path = tostring(archive_path or ""):gsub("/+$", "")
   local home = deps.home or os.getenv("HOME") or ""
+  local is_dir = is_directory(archive_path)
   if not fixinstall.under_home(archive_path, home)
-      or not fixinstall.installable_name(archive_path) then
+      or (not is_dir and not fixinstall.installable_name(archive_path)) then
     res.errorCode = "invalid_archive"
     return res
   end
-  if not exists(archive_path) then
+  if not is_dir and not exists(archive_path) then
     res.errorCode = "archive_missing"
     return res
   end
 
-  local is_inno = fixinstall.is_inno_name(archive_path)
-  local bin = deps.bin or (not is_inno and fixinstall.find_7z()) or nil
-  if not is_inno and not bin then
+  local is_inno = (not is_dir) and fixinstall.is_inno_name(archive_path)
+  local bin = deps.bin or ((not is_dir and not is_inno) and fixinstall.find_7z()) or nil
+  if not is_dir and not is_inno and not bin then
     res.errorCode = "no_extractor"
     return res
   end
@@ -756,7 +815,9 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
       .. " </dev/null 2>/dev/null")))
   end
   local entries
-  if is_inno then
+  if is_dir then
+    entries = list_directory_entries(archive_path)
+  elseif is_inno then
     local itext = read_pipe(shq(inno_bin) .. " -l -- " .. shq(archive_path) .. " 2>/dev/null")
     entries = fixinstall.safe_entries(fixinstall.parse_inno_listing(itext))
   else
@@ -856,12 +917,49 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
     end
   end
 
+  -- SHA-256 verified backups for ALL overwritten game files so Un-fix can
+  -- restore originals byte-for-byte without requiring Steam Verify. Earlier
+  -- backups hold the true pre-fix originals and are preserved across re-applies.
+  local file_backups, fb_seen = {}, {}
+  for _, b in ipairs(prev and type(prev.backups) == "table" and prev.backups or {}) do
+    if type(b) == "table" and type(b.path) == "string" and type(b.sha256) == "string"
+        and not fb_seen[b.path] and exists(root .. "/" .. FILE_BACKUP_DIR .. "/" .. b.path) then
+      file_backups[#file_backups + 1] = {
+        path = b.path,
+        sha256 = b.sha256,
+        installPath = type(b.installPath) == "string" and b.installPath or (prev and prev.installPath) or install_dir,
+      }
+      fb_seen[b.path] = true
+    end
+  end
+  for _, e in ipairs(entries) do
+    if replaced_set[e.path] and not fb_seen[e.path] then
+      local orig_path = install_dir .. "/" .. e.path
+      local orig_hash = hash_file(orig_path)
+      local saved = root .. "/" .. FILE_BACKUP_DIR .. "/" .. e.path
+      local parent = saved:match("^(.*)/[^/]+$")
+      if not orig_hash or not parent
+          or os.execute("mkdir -p -- " .. shq(parent) .. " && cp -f -- "
+            .. shq(orig_path) .. " " .. shq(saved) .. " 2>/dev/null") ~= true
+          or hash_file(saved) ~= orig_hash then
+        res.errorCode = "backup_failed"
+        return res
+      end
+      file_backups[#file_backups + 1] = {
+        path = e.path,
+        sha256 = orig_hash,
+        installPath = install_dir,
+      }
+      fb_seen[e.path] = true
+    end
+  end
+
   local lumen = home .. "/.local/share/Lumen/"
-  local source = archive_path:find(lumen .. "freetp_dl/", 1, true) == 1 and "freetp"
+  local source = is_dir and "folder"
+    or archive_path:find(lumen .. "freetp_dl/", 1, true) == 1 and "freetp"
     or archive_path:find(lumen .. "onlinefix_dl/", 1, true) == 1 and "onlinefix"
     or "archive"
-  -- Recorded BEFORE extraction: a half-finished extract stays revertible.
-  if not write_manifest(root, json.encode({
+  local record = {
     installedAt = os.time(),
     archive = archive_path:match("([^/]+)$") or archive_path,
     source = source,
@@ -869,13 +967,28 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
     installPath = install_dir,
     added = added,
     replaced = replaced,
+    backups = #file_backups > 0 and file_backups or nil,
+    marker = FIX_RECORD_FILE,
     eos = (#eos_configs > 0 or #backups > 0) and { configs = eos_configs, backups = backups } or nil,
-  }), deps.open_file or io.open) then
+  }
+  -- Recorded BEFORE extraction: a half-finished extract stays revertible.
+  if not write_manifest(root, json.encode(record), deps.open_file or io.open) then
     res.errorCode = "record_failed"
     return res
   end
 
-  if is_inno then
+  if is_dir then
+    for _, e in ipairs(entries) do
+      local src = archive_path .. "/" .. e.path
+      local dst = install_dir .. "/" .. e.path
+      local parent = dst:match("^(.*)/[^/]+$")
+      if parent then os.execute("mkdir -p -- " .. shq(parent) .. " 2>/dev/null") end
+      if execute("cp -f -- " .. shq(src) .. " " .. shq(dst) .. " 2>/dev/null") ~= true then
+        res.errorCode = "extract_failed"
+        return res
+      end
+    end
+  elseif is_inno then
     -- innoextract recreates app/ (the {app} payload) and tmp/ (wizard
     -- resources) under the stage; only app/* moves into the game folder.
     if execute(shq(inno_bin) .. " -d " .. shq(stage) .. " -- "
@@ -904,6 +1017,14 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
   end
   if #eos_configs > 0 then res.eos = rewrite_eos_configs(install_dir, eos_configs, home) end
 
+  -- Write game-local fix record under .luatools-fix/lumen-fix.json (best-effort).
+  local marker_path = install_dir .. "/" .. FIX_RECORD_FILE
+  local marker_dir = marker_path:match("^(.*)/[^/]+$")
+  if marker_dir then
+    os.execute("mkdir -p -- " .. shq(marker_dir) .. " 2>/dev/null")
+    write_file_atomic(marker_path, json.encode(record))
+  end
+
   -- A Windows online fix swaps the AppID at the client layer itself; the same
   -- swap has to happen in SLSsteam, or this side reports the real AppID while
   -- the other players' fixes report the fake one and SteamNetworkingSockets
@@ -925,13 +1046,16 @@ local function install_archive(appid, archive_path, install_path_hint, deps)
     if type(rec) == "table" then
       rec.fakeAppId = res.fakeAppId
       write_manifest(root, json.encode(rec), deps.open_file or io.open)
+      if marker_dir then write_file_atomic(marker_path, json.encode(rec)) end
     end
   end
 
   res.success = true
   res.kind = kind
+  res.source = source
   res.added = #added
   res.replaced = #replaced
+  res.backedUp = #file_backups
   return res
 end
 
@@ -967,6 +1091,7 @@ end
 function fixinstall.revert(appid, deps)
   deps = deps or {}
   local res = { success = true, reverted = false, removed = 0,
+    restored = 0, verifiedRestores = 0, checksumMismatches = 0,
     replacedCount = 0, needsVerify = false }
   appid = tonumber(appid)
   if not appid then return res end
@@ -985,6 +1110,21 @@ function fixinstall.revert(appid, deps)
     return res
   end
   res.removed = removed
+
+  -- Remove our game-local .luatools-fix/lumen-fix.json marker if recorded.
+  if type(m.marker) == "string" and m.marker ~= "" then
+    local safe_marker = fixinstall.safe_entries({ { path = m.marker } })
+    if safe_marker and safe_marker[1] then
+      local mp = safe_marker[1].path
+      os.execute("rm -f -- " .. shq(m.installPath .. "/" .. mp))
+      local parent = mp:match("^(.*)/[^/]+$")
+      if parent then
+        os.execute("cd " .. shq(m.installPath) .. " && rmdir -p --ignore-fail-on-non-empty -- "
+          .. shq(parent) .. " 2>/dev/null")
+      end
+    end
+  end
+
   -- Configs an EOS fix overwrote come back from the record's backups (Verify
   -- cannot restore them). A failed restore keeps the record, so Unfix can be
   -- pressed again.
@@ -999,6 +1139,7 @@ function fixinstall.revert(appid, deps)
     return res
   end
   local restored = {}
+  local restored_count = 0
   for _, e in ipairs(restore) do
     if os.execute("cp -f -- " .. shq(root .. "/" .. EOS_BACKUP_DIR .. "/" .. e.path) .. " "
         .. shq(m.installPath .. "/" .. e.path) .. " 2>/dev/null") ~= true then
@@ -1007,8 +1148,50 @@ function fixinstall.revert(appid, deps)
       return res
     end
     restored[e.path] = true
+    restored_count = restored_count + 1
   end
-  res.restored = #restore
+
+  -- SHA-256 verified backups of all other overwritten game files.
+  if type(m.backups) == "table" then
+    local fb_entries = {}
+    for _, b in ipairs(m.backups) do
+      if type(b) == "table" and type(b.path) == "string" then
+        fb_entries[#fb_entries + 1] = { path = b.path }
+      end
+    end
+    local safe_fb = fixinstall.safe_entries(fb_entries)
+    if not safe_fb then
+      res.success = false
+      res.errorCode = "record_invalid"
+      return res
+    end
+    for _, b in ipairs(m.backups) do
+      if type(b) == "table" and type(b.path) == "string" and not restored[b.path] then
+        local src = root .. "/" .. FILE_BACKUP_DIR .. "/" .. b.path
+        local target_root = (type(b.installPath) == "string" and b.installPath ~= "")
+          and b.installPath or m.installPath
+        local dst = target_root .. "/" .. b.path
+        local want_sha = type(b.sha256) == "string" and b.sha256 or nil
+        local src_sha = want_sha and hash_file(src) or nil
+        if want_sha and src_sha == want_sha then
+          local parent = dst:match("^(.*)/[^/]+$")
+          if parent then os.execute("mkdir -p -- " .. shq(parent) .. " 2>/dev/null") end
+          if os.execute("cp -f -- " .. shq(src) .. " " .. shq(dst) .. " 2>/dev/null") == true
+              and hash_file(dst) == want_sha then
+            restored[b.path] = true
+            restored_count = restored_count + 1
+            res.verifiedRestores = res.verifiedRestores + 1
+          else
+            res.checksumMismatches = res.checksumMismatches + 1
+          end
+        else
+          res.checksumMismatches = res.checksumMismatches + 1
+        end
+      end
+    end
+  end
+
+  res.restored = restored_count
   for _, p in ipairs(type(m.replaced) == "table" and m.replaced or {}) do
     if not restored[p] then res.replacedCount = res.replacedCount + 1 end
   end

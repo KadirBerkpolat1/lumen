@@ -421,10 +421,14 @@ else
   check("e2e: manifest recorded, the DLL list among the added files", #man.added == 3
     and man.added[3] == ".slssteam_fix_dlls"
     and #man.replaced == 1 and man.replaced[1] == "sub/replace_me.dll")
+  check("e2e: game-local .luatools-fix/lumen-fix.json marker written",
+    read_file(game .. "/.luatools-fix/lumen-fix.json") ~= nil)
   local rv = fi.revert(4312190, { store_root = function() return store end })
-  check("e2e: revert removes added files and asks Steam for the replaced one",
-    rv.reverted == true and rv.removed == 3 and rv.replacedCount == 1
-      and rv.needsVerify == true
+  check("e2e: revert removes added files and restores the replaced one via SHA-256 backup",
+    rv.reverted == true and rv.removed == 3 and rv.restored == 1 and rv.verifiedRestores == 1
+      and rv.replacedCount == 0 and rv.needsVerify == false
+      and read_file(game .. "/sub/replace_me.dll") == "ORIGINAL-DLL"
+      and read_file(game .. "/.luatools-fix/lumen-fix.json") == nil
       and read_file(game .. "/added_fix.dll") == nil
       and read_file(game .. "/deep/nested.txt") == nil
       and read_file(game .. "/.slssteam_fix_dlls") == nil
@@ -527,17 +531,44 @@ else
     spied.success == true and stdin_closed)
   fi.revert(4312190, deps)
 
-  -- A second install reverts the first, but the game file the first one
-  -- overwrote still holds fix content, so Unfix must still offer verify.
+  -- A second install reverts the first, keeping the first one's original backup
+  -- so Unfix restores the true pre-fix game file byte-for-byte.
   fi.install(4312190, zip, game, deps)
   local other = archive("other.zip", { ["other_fix.dll"] = "OTHER" })
   check("e2e: a second install keeps the first one's overwritten files listed",
     fi.install(4312190, other, game, deps).success == true
       and manifest().replaced[1] == "sub/replace_me.dll"
       and read_file(game .. "/added_fix.dll") == nil)
-  check("e2e: ...so its revert still asks for verify",
-    fi.revert(4312190, deps).needsVerify == true)
+  local rv_second = fi.revert(4312190, deps)
+  check("e2e: ...so its revert restores the original file cleanly without Verify",
+    rv_second.reverted == true and rv_second.restored == 1 and rv_second.needsVerify == false
+      and read_file(game .. "/sub/replace_me.dll") == "ORIGINAL-DLL")
 
+  -- Tampered or missing backup falls back to needsVerify=true safely.
+  fi.install(4312190, zip, game, deps)
+  write_file(store .. "/4312190/file_backups/sub/replace_me.dll", "CORRUPT-BACKUP")
+  local rv_corrupt = fi.revert(4312190, deps)
+  check("e2e: corrupted backup SHA-256 is refused and falls back to needsVerify",
+    rv_corrupt.reverted == true and rv_corrupt.restored == 0 and rv_corrupt.checksumMismatches == 1
+      and rv_corrupt.replacedCount == 1 and rv_corrupt.needsVerify == true
+      and read_file(game .. "/sub/replace_me.dll") == "FIX-REPLACED")
+  write_file(game .. "/sub/replace_me.dll", "ORIGINAL-DLL")
+
+  -- Local folder install copies files, backs up replaced files with SHA-256, and reverts cleanly.
+  local fix_dir = tmp .. "/local_fix_folder"
+  os.execute("mkdir -p -- " .. q(fix_dir .. "/sub"))
+  write_file(fix_dir .. "/folder_added.dll", "FOLDER-NEW")
+  write_file(fix_dir .. "/sub/replace_me.dll", "FOLDER-REPLACED")
+  local r_dir = fi.install(4312190, fix_dir, game, deps)
+  check("e2e: local folder install succeeds with SHA-256 backup",
+    r_dir.success == true and r_dir.source == "folder" and r_dir.replaced == 1 and r_dir.backedUp == 1
+      and read_file(game .. "/folder_added.dll") == "FOLDER-NEW"
+      and read_file(game .. "/sub/replace_me.dll") == "FOLDER-REPLACED")
+  local rv_dir = fi.revert(4312190, deps)
+  check("e2e: local folder revert restores replaced file byte-for-byte",
+    rv_dir.reverted == true and rv_dir.restored == 1 and rv_dir.needsVerify == false
+      and read_file(game .. "/folder_added.dll") == nil
+      and read_file(game .. "/sub/replace_me.dll") == "ORIGINAL-DLL")
   -- The next record is written in full or not at all: when it cannot be
   -- written, the previous one (and its overwritten files) stays.
   local function with_open(open)
@@ -564,12 +595,16 @@ else
   for _, case in ipairs(failing_writes) do
     fi.install(4312190, zip, game, deps)
     local nf = fi.install(4312190, other, game, with_open(case[2]))
+    local kept_replaced = (manifest().replaced or {})[1]
+    local tmp_left = read_file(store .. "/4312190/manifest.json.tmp")
+    local rv_kept = fi.revert(4312190, deps)
     check("e2e: record write fails (" .. case[1] .. ") -> record_failed, nothing extracted, previous record kept",
       nf.success == false and nf.errorCode == "record_failed"
         and read_file(game .. "/other_fix.dll") == nil
-        and (manifest().replaced or {})[1] == "sub/replace_me.dll"
-        and read_file(store .. "/4312190/manifest.json.tmp") == nil
-        and fi.revert(4312190, deps).needsVerify == true)
+        and kept_replaced == "sub/replace_me.dll"
+        and tmp_left == nil
+        and rv_kept.reverted == true and rv_kept.restored == 1 and rv_kept.needsVerify == false
+        and read_file(game .. "/sub/replace_me.dll") == "ORIGINAL-DLL")
   end
 
   -- On a nested depot the second archive can pick another game root; the
@@ -583,10 +618,10 @@ else
   local dll_fix = archive("dll_fix.zip", { ["SteamFix64.dll"] = "FIX" })
   fi.install(4312190, exe_fix, nested, nested_deps)
   fi.install(4312190, dll_fix, nested, nested_deps)
-  check("e2e: an overwritten file stays recorded when the next install picks another root",
-    manifest().installPath == nested and manifest().replaced[1] == "G.exe"
-      and fi.revert(4312190, nested_deps).needsVerify == true)
-
+  local rv_nested = fi.revert(4312190, nested_deps)
+  check("e2e: an overwritten file stays backed up and restores even when the next install picks another root",
+    rv_nested.reverted == true and rv_nested.restored == 1 and rv_nested.needsVerify == false
+      and read_file(nested .. "/G/G.exe") == "GAME-EXE")
   -- The DLL list belongs beside the fix: LuaTools reads it from the game root.
   local rooted = fi.install(4312190, archive("rooted_fix.zip",
     { ["G.exe"] = "FIX-EXE", ["SteamFix64.dll"] = "FIX" }), nested, nested_deps)
@@ -767,11 +802,11 @@ if bin then
     rv_fail.success == false and rv_fail.errorCode == "restore_failed" and rec() ~= nil)
   os.rename(backup .. ".away", backup)
   local rv = fi.revert(4312190, deps)
-  check("eos e2e: revert restores the original config byte for byte, Verify only for the DLL",
-    rv.success == true and rv.reverted == true and rv.restored == 1 and rv.replacedCount == 1
-      and rv.needsVerify == true and read_file(game .. "/" .. CFG) == ORIGINAL_CFG
+  check("eos e2e: revert restores both original config and original SDK byte for byte without Verify",
+    rv.success == true and rv.reverted == true and rv.restored == 2 and rv.replacedCount == 0
+      and rv.needsVerify == false and read_file(game .. "/" .. CFG) == ORIGINAL_CFG
+      and read_file(game .. "/" .. SDK) == "GENUINE-SDK"
       and read_file(game .. "/.slssteam_fix_dlls") == nil and rec() == nil)
-
   -- No config in the game: the shipped one is added, so revert just removes it.
   reset_config(nil)
   write_file(game .. "/" .. SDK, "GENUINE-SDK")
@@ -779,8 +814,9 @@ if bin then
   check("eos e2e: a config the game did not have is added, with no backup",
     added.success == true and #rec().eos.backups == 0 and read_file(backup) == nil)
   local rv_added = fi.revert(4312190, deps)
-  check("eos e2e: revert removes the added config and its settings folder",
-    rv_added.success == true and rv_added.restored == 0 and read_file(game .. "/" .. CFG) == nil
+  check("eos e2e: revert removes the added config and its settings folder, restoring SDK",
+    rv_added.success == true and rv_added.restored == 1 and read_file(game .. "/" .. CFG) == nil
+      and read_file(game .. "/" .. SDK) == "GENUINE-SDK"
       and os.execute("test -d " .. q(game .. "/" .. W64 .. "/nepice_settings")) ~= true
       and os.execute("test -d " .. q(game .. "/" .. W64)) == true)
 

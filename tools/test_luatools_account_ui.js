@@ -124,9 +124,9 @@ check("U34 a sign-in handoff runs the OAuth progress animation",
     && styles.includes(".lumen-account-login-grid>section.handoff{"));
 check("U26 account, catalogue and fix cards share one surface",
   styles.includes(".lumen-account-card{box-sizing:border-box;overflow:hidden;border:1px solid #414955;")
-    && styles.includes("border-radius:8px;background:#20242b;}")
-    && styles.includes("border:1px solid #414955;border-radius:8px;background:#20242b;color:#dcdedf;")
-    && styles.includes(".lumen-fixes-fix-card{padding:17px 18px;border:1px solid #414955;border-radius:8px;background:#20242b;}")
+    && styles.includes("border-radius:10px;background:#20242b;}")
+    && styles.includes("border:1px solid #414955;border-radius:10px;background:#20242b;color:#dcdedf;")
+    && styles.includes(".lumen-fixes-fix-card{padding:17px 18px;border:1px solid #414955;border-radius:10px;background:#20242b;}")
     && !styles.includes("background:#191b20")
     && !styles.includes("background:#181a1f"));
 check("U27 signing out announces itself on hover",

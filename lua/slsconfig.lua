@@ -219,6 +219,11 @@ end
 -- Kept thin and separate from the pure parse/set_key logic above.
 
 function slsconfig.default_path()
+  local ok, slsprofile = pcall(require, "slsprofile")
+  if ok and type(slsprofile) == "table" and type(slsprofile.root) == "function" then
+    local root = slsprofile.root()
+    if root and root ~= "" then return root .. "/config.yaml" end
+  end
   local home = os.getenv("HOME") or ""
   if home == "" then return nil end
   return home .. "/.config/SLSsteam/config.yaml"

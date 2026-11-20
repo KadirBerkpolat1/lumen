@@ -212,8 +212,48 @@
   function cloudRenderProviderSettings(body, S, provider) {
     var current = _cloudDraft.settings[provider] || (_cloudDraft.settings[provider] = {});
     if (provider === "folder") {
-      body.appendChild(cloudTextRow(S.folderPath, current.sync_folder_path,
-        "/mnt/cloud-saves", false, function (value) { current.sync_folder_path = value; }));
+      var row = document.createElement("div"); row.className = "lumen-row";
+      var wrap = document.createElement("div"); wrap.className = "lumen-lblwrap";
+      var label = document.createElement("div"); label.className = "lbl"; label.textContent = S.folderPath;
+      wrap.appendChild(label); row.appendChild(wrap);
+      var ctrl = document.createElement("span"); ctrl.className = "lumen-ctrl lumen-cloud-folder-ctrl";
+      var input = document.createElement("input"); input.type = "text";
+      input.value = current.sync_folder_path || ""; input.placeholder = "~/CloudSaves/Steam";
+      var applyFolder = function (val) {
+        input.value = val;
+        current.sync_folder_path = val;
+        cloudRefreshDraftActions();
+      };
+      input.addEventListener("input", function () {
+        current.sync_folder_path = input.value;
+        cloudRefreshDraftActions();
+      });
+      var browse = document.createElement("button");
+      browse.type = "button";
+      browse.className = "lumen-account-button";
+      browse.textContent = S.pickFolder || "Browse\u2026";
+      browse.addEventListener("click", function () {
+        browse.disabled = true;
+        call("LumenPickDirectory", { initialPath: input.value || "" })
+          .then(function (raw) {
+            var res = typeof raw === "string" ? JSON.parse(raw) : raw;
+            if (res && res.success && !res.cancelled && res.path) applyFolder(res.path);
+          })
+          .catch(function () {})
+          .then(function () { browse.disabled = false; });
+      });
+      ctrl.appendChild(input); ctrl.appendChild(browse);
+      row.appendChild(ctrl); body.appendChild(row);
+
+      var presets = document.createElement("div"); presets.className = "lumen-cloud-presets";
+      var presetBtn = document.createElement("button");
+      presetBtn.type = "button";
+      presetBtn.className = "lumen-cloud-preset";
+      presetBtn.textContent = S.presetSteamCloud || "~/CloudSaves/Steam";
+      presetBtn.addEventListener("click", function () { applyFolder("~/CloudSaves/Steam"); });
+      presets.appendChild(presetBtn);
+      body.appendChild(presets);
+
       var hint = document.createElement("div"); hint.className = "lumen-desc";
       hint.textContent = S.folderPathHint; body.appendChild(hint); return;
     }
