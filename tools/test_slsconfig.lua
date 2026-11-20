@@ -52,12 +52,10 @@ end
 
 -- ── parse() defaults when a key is absent ──────────────────────────────────
 do
-  -- API defaults to true, SafeMode to false per config.cpp. DisableCloud is
-  -- CloudRedirect-aware, so pin cr_present=false here to assert its no-CR
-  -- default (true). CR-aware behaviour is covered in its own block below.
-  local v = slsconfig.parse("LogLevel: 2\n", false)
-  assert_eq(v.API,          true,  "API default true")
-  assert_eq(v.DisableCloud, true,  "DisableCloud default true (no CloudRedirect)")
+  -- API and DisableCloud default to false when absent, matching src/config.cpp.
+  local v = slsconfig.parse("LogLevel: 2\n")
+  assert_eq(v.API,          false, "API default false")
+  assert_eq(v.DisableCloud, false, "DisableCloud default false when absent")
   assert_eq(v.DisableParentalRestrictions, false, "parental unlock defaults off")
   assert_eq(v.SafeMode,     false, "SafeMode default false")
   assert_eq(v.LogLevel,     2,     "LogLevel read")
@@ -85,15 +83,17 @@ end
 
 -- ── deprecated keys are still parsed but flagged hidden (not rendered) ──────
 do
-  local entry
-  for _, e in ipairs(slsconfig.SCHEMA) do
-    if e.key == "SafeMode" then entry = e end
+  for _, removed_key in ipairs({ "SafeMode", "WarnHashMissmatch", "PlayNotOwnedGames", "AutoFilterList" }) do
+    local entry
+    for _, e in ipairs(slsconfig.SCHEMA) do
+      if e.key == removed_key then entry = e end
+    end
+    assert_true(entry ~= nil, removed_key .. " kept in SCHEMA (still parsed/reset)")
+    assert_eq(entry.hidden, true, removed_key .. " flagged hidden (no-op toggle not shown)")
   end
-  assert_true(entry ~= nil, "SafeMode kept in SCHEMA (still parsed/reset)")
-  assert_eq(entry.hidden, true, "SafeMode flagged hidden (no-op toggle not shown)")
 end
 
--- ── DisableCloud default is CloudRedirect-aware ────────────────────────────
+-- ── DisableCloud reset default is CloudRedirect-aware ──────────────────────
 do
   -- has_cloudredirect(): probes ~/.local/share/CloudRedirect/cloud_redirect.so
   -- via an injectable existence check.
@@ -111,9 +111,8 @@ do
   assert_eq(slsconfig.default_for("DisableFamilyShareLock", true),  true,  "FamilyShareLock stays default ON")
   assert_eq(slsconfig.default_for("PlayNotOwnedGames", true), false, "PlayNotOwnedGames stays default OFF")
 
-  -- parse() honours the passed cr_present for the absent-key default.
-  assert_eq(slsconfig.parse("LogLevel: 2\n", true).DisableCloud,  false, "parse CR -> false")
-  assert_eq(slsconfig.parse("LogLevel: 2\n", false).DisableCloud, true,  "parse no-CR -> true")
+  -- parse() mirrors slsteam-moon's absent-key default (false).
+  assert_eq(slsconfig.parse("LogLevel: 2\n").DisableCloud, false, "parse absent DisableCloud -> false")
 end
 
 -- ── parse() accepts the various YAML boolean spellings ─────────────────────
@@ -178,15 +177,16 @@ do
   assert_true(out:find("NotifyInit: yes", 1, true), "prefix-sibling untouched")
 end
 
--- ── default_path() resolves under HOME ──────────────────────────────────────
+-- ── default_path() honours XDG_CONFIG_HOME and falls back to HOME ──────────
 do
-  local saved = os.getenv("HOME")
-  -- We can't setenv from plain Lua portably; just assert it ends correctly when
-  -- HOME is present (the CI/host always has HOME).
-  if saved and saved ~= "" then
-    assert_eq(slsconfig.default_path(), saved .. "/.config/SLSsteam/config.yaml",
-      "default_path under HOME")
-  end
+  assert_eq(slsconfig.default_path(function(k)
+    if k == "XDG_CONFIG_HOME" then return "/custom/xdg" end
+    if k == "HOME" then return "/home/u" end
+  end), "/custom/xdg/SLSsteam/config.yaml", "XDG_CONFIG_HOME wins when absolute")
+  assert_eq(slsconfig.default_path(function(k)
+    if k == "XDG_CONFIG_HOME" then return "relative/xdg" end
+    if k == "HOME" then return "/home/u" end
+  end), "/home/u/.config/SLSsteam/config.yaml", "relative XDG_CONFIG_HOME falls back to HOME")
 end
 
 -- ── read() + write_key() round-trip against a real temp file ───────────────
@@ -211,7 +211,7 @@ end
 -- ── read() of a missing file yields defaults, not an error ─────────────────
 do
   local v = slsconfig.read("/nonexistent/path/zzz/config.yaml")
-  assert_eq(v.API, true, "missing file -> defaults")
+  assert_eq(v.API, false, "missing file -> defaults (API=false)")
 end
 
 -- ── write_key() REFUSES to clobber an empty/unreadable config ──────────────
@@ -270,16 +270,20 @@ do
   local f = assert(io.open(tmp, "wb"))
   -- a comment + an unrelated block + several schema keys at non-default values
   f:write("# my notes\nAdditionalApps:\n  - 480\nPlayNotOwnedGames: yes\n" ..
+          "AchievementOwnerId: 76561198028121353\nAPI: yes\n" ..
           "DisableFamilyShareLock: no\nLogLevel: 5\nUseWhitelist: yes\n")
   f:close()
   local ok = slsconfig.reset_to_defaults(tmp)
   assert_true(ok, "reset ok on a valid config")
   local v = slsconfig.read(tmp)
   assert_eq(v.PlayNotOwnedGames, false, "PlayNotOwnedGames -> default")
+  assert_eq(v.AchievementOwnerId, 0, "AchievementOwnerId -> 0 on reset")
+  assert_eq(v.API, false, "API -> false on reset")
   assert_eq(v.DisableFamilyShareLock, true, "DisableFamilyShareLock -> default")
   assert_eq(v.UseWhitelist, false, "UseWhitelist -> default")
   assert_eq(v.LogLevel, 2, "LogLevel -> default")
   local rf = io.open(tmp, "rb"); local body = rf:read("*a"); rf:close()
+  assert_true(body:find("SafeMode:", 1, true) == nil, "absent hidden keys are not appended")
   assert_true(body:find("# my notes", 1, true) ~= nil, "comment preserved")
   assert_true(body:find("AdditionalApps", 1, true) ~= nil and body:find("480", 1, true) ~= nil,
               "unrelated block preserved")

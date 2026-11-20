@@ -27,6 +27,7 @@ local write_seq = 0
 -- so exposing a switch that does nothing would only confuse.
 slsconfig.SCHEMA = {
   { key = "PlayNotOwnedGames",      type = "bool",   default = false, level = "info",
+    hidden = true,
     label = "Play not-owned games" },
   { key = "DisableFamilyShareLock", type = "bool",   default = true,  level = "normal",
     label = "Disable Family Share lock" },
@@ -34,6 +35,7 @@ slsconfig.SCHEMA = {
     restart_on_change = true,
     label = "Disable parental restrictions" },
   { key = "AutoFilterList",         type = "bool",   default = true,  level = "advanced",
+    hidden = true,
     label = "Auto-filter app list" },
   { key = "UseWhitelist",           type = "bool",   default = false, level = "danger",
     label = "Use whitelist (instead of blacklist)" },
@@ -45,10 +47,11 @@ slsconfig.SCHEMA = {
   { key = "NotifyInit",             type = "bool",   default = true,  level = "normal",
     label = "Notify on init" },
   { key = "WarnHashMissmatch",      type = "bool",   default = false, level = "advanced",
+    hidden = true,
     label = "Warn on steamclient hash mismatch" },
-  { key = "API",                    type = "bool",   default = true,  level = "advanced",
-    label = "Enable control API (/tmp/SLSsteam.API)" },
-  { key = "DisableCloud",           type = "bool",   default = true,  level = "normal",
+  { key = "API",                    type = "bool",   default = false, level = "advanced",
+    label = "Enable control API ($XDG_RUNTIME_DIR/SLSsteam/api)" },
+  { key = "DisableCloud",           type = "bool",   default = false, level = "normal",
     label = "Disable Steam Cloud" },
   { key = "AutoUpdateApps",         type = "bool",   default = true,  level = "normal",
     restart_on_change = true,
@@ -60,6 +63,9 @@ slsconfig.SCHEMA = {
   { key = "FakeWalletBalance",      type = "int",    default = 0,     level = "normal",
     min = 0, max = 2147483647,
     label = "Fake wallet balance (0 = off)" },
+  { key = "AchievementOwnerId",     type = "int",    default = 0,     level = "advanced",
+    hidden = true,
+    label = "Achievement owner ID" },
   { key = "LogLevel",               type = "enum",   default = 2,     level = "advanced",
     label = "Log level",
     options = { 0, 1, 2, 3, 4, 5, 6 },
@@ -70,26 +76,38 @@ slsconfig.SCHEMA = {
 local TRUE_TOKENS  = { y = true, yes = true, ["true"] = true, on = true }
 local FALSE_TOKENS = { n = true, no = true, ["false"] = true, off = true }
 
--- Detect an installed CloudRedirect hook. Its presence flips the sane default
--- for DisableCloud: CloudRedirect can only intercept cloud saves while Steam
--- Cloud is ENABLED, so when it is installed we default DisableCloud to OFF
--- (false). Without it we mirror slsteam-moon's own default of disabling cloud
--- (true). `home`/`exists` are injectable so this stays host-testable.
+local function elf_class(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local hdr = f:read(5)
+  f:close()
+  if not hdr or #hdr < 5 or hdr:sub(1, 4) ~= "\127ELF" then return nil end
+  return hdr:byte(5) -- 1 = ELF32, 2 = ELF64
+end
+
+-- Detect a usable CloudRedirect hook. On 64-bit Steam (steamrt64), a 32-bit
+-- cloud_redirect.so is skipped by the wrapper and must read as absent.
+-- `home`/`exists` remain injectable for host unit tests.
 function slsconfig.has_cloudredirect(home, exists)
   home = home or os.getenv("HOME") or ""
   if home == "" then return false end
-  exists = exists or function(p)
-    local f = io.open(p, "rb")
-    if f then f:close(); return true end
-    return false
+  local so_path = home .. "/.local/share/CloudRedirect/cloud_redirect.so"
+  if exists ~= nil then
+    return exists(so_path) and true or false
   end
-  return exists(home .. "/.local/share/CloudRedirect/cloud_redirect.so") and true or false
+  local so_cls = elf_class(so_path)
+  if not so_cls then return false end
+  local steam64 = elf_class(home .. "/.steam/steam/steamrt64/steam")
+               or elf_class(home .. "/.local/share/Steam/steamrt64/steam")
+  if steam64 == 2 then
+    return so_cls == 2
+  end
+  return true
 end
 
--- Effective default for a SCHEMA key. Every key uses its static SCHEMA default
--- except DisableCloud, which is CloudRedirect-aware (see has_cloudredirect):
--- CR present -> false (don't disable cloud), CR absent -> true. `cr_present`
--- may be passed explicitly (tests); nil means "detect now".
+-- Reset default for a SCHEMA key. Every key uses its static SCHEMA default
+-- except DisableCloud on reset, which is CloudRedirect-aware: CR present ->
+-- false (keep cloud enabled), CR absent -> true (avoid cloud sync errors).
 function slsconfig.default_for(key, cr_present)
   if key == "DisableCloud" then
     if cr_present == nil then cr_present = slsconfig.has_cloudredirect() end
@@ -137,15 +155,14 @@ local function to_string(raw)
   return inner or s
 end
 
--- parse(text[, cr_present]) -> { Key = typedValue } for every SCHEMA key
--- (defaults applied when the key is absent or unparseable). `cr_present` is
--- forwarded to default_for so the DisableCloud default is CloudRedirect-aware;
--- nil means "detect now".
-function slsconfig.parse(text, cr_present)
+-- parse(text) -> { Key = typedValue } for every SCHEMA key. When a key is
+-- absent or unparseable, uses entry.default so the UI reflects the effective
+-- default slsteam-moon's C++ loader applies (API=false, DisableCloud=false).
+function slsconfig.parse(text)
   text = text or ""
   local out = {}
   for _, entry in ipairs(slsconfig.SCHEMA) do
-    local dflt = slsconfig.default_for(entry.key, cr_present)
+    local dflt = entry.default
     local raw = raw_value(text, entry.key)
     if raw == nil then
       out[entry.key] = dflt
@@ -218,27 +235,38 @@ end
 -- ── IO layer ────────────────────────────────────────────────────────────────
 -- Kept thin and separate from the pure parse/set_key logic above.
 
-function slsconfig.default_path()
-  local ok, slsprofile = pcall(require, "slsprofile")
-  if ok and type(slsprofile) == "table" and type(slsprofile.root) == "function" then
-    local root = slsprofile.root()
-    if root and root ~= "" then return root .. "/config.yaml" end
+function slsconfig.config_dir(getenv)
+  if getenv == nil then
+    local ok, slsprofile = pcall(require, "slsprofile")
+    if ok and type(slsprofile) == "table" and type(slsprofile.root) == "function" then
+      local root = slsprofile.root()
+      if root and root ~= "" then return root end
+    end
+    getenv = os.getenv
   end
-  local home = os.getenv("HOME") or ""
+  local xdg = getenv("XDG_CONFIG_HOME") or ""
+  if xdg:sub(1, 1) == "/" then
+    return xdg .. "/SLSsteam"
+  end
+  local home = getenv("HOME") or ""
   if home == "" then return nil end
-  return home .. "/.config/SLSsteam/config.yaml"
+  return home .. "/.config/SLSsteam"
 end
 
--- read(path[, cr_present]) -> values table. A missing/unreadable file yields
--- all defaults (slsteam-moon itself falls back to defaults on a missing
--- config). `cr_present` is forwarded to parse for the DisableCloud default.
-function slsconfig.read(path, cr_present)
-  if not path then return slsconfig.parse("", cr_present) end
+function slsconfig.default_path(getenv)
+  local dir = slsconfig.config_dir(getenv)
+  return dir and (dir .. "/config.yaml") or nil
+end
+
+-- read(path) -> values table. A missing/unreadable file yields all defaults
+-- (slsteam-moon itself falls back to defaults on a missing config).
+function slsconfig.read(path)
+  if not path then return slsconfig.parse("") end
   local f = io.open(path, "rb")
-  if not f then return slsconfig.parse("", cr_present) end
+  if not f then return slsconfig.parse("") end
   local data = f:read("*a") or ""
   f:close()
-  return slsconfig.parse(data, cr_present)
+  return slsconfig.parse(data)
 end
 
 -- Count how many SCHEMA keys appear in the text (a cheap "does this look like a
@@ -315,7 +343,9 @@ function slsconfig.reset_to_defaults(path, cr_present)
   if cr_present == nil then cr_present = slsconfig.has_cloudredirect() end
   local out = data
   for _, entry in ipairs(slsconfig.SCHEMA) do
-    out = slsconfig.set_key(out, entry.key, slsconfig.default_for(entry.key, cr_present))
+    if not entry.hidden or raw_value(out, entry.key) ~= nil then
+      out = slsconfig.set_key(out, entry.key, slsconfig.default_for(entry.key, cr_present))
+    end
   end
 
   local tmp = string.format("%s.tmp.lumen.%d.%d.%d", path,
