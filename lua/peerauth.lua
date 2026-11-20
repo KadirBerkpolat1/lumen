@@ -44,7 +44,7 @@ local STEAM_EXE = { steam = true, steamwebhelper = true }
 -- "/tmp/steam" squatter.
 local STEAM_TREE = {
   "/.steam/", "/.local/share/Steam/", "/ubuntu12_32/", "/ubuntu12_64/",
-  "/linux32/", "/linux64/", "/steamapps/",
+  "/linux32/", "/linux64/", "/steamrt64/", "/steamrt32/", "/steamapps/",
 }
 
 -- listener_inodes(text, port) -> array of socket inodes listening on `port`.

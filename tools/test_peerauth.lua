@@ -77,6 +77,12 @@ do
     "steam accepted")
   ok(peerauth.is_steam_exe("/home/u/.local/share/Steam/ubuntu12_32/steam"),
     "the data-dir installation is accepted")
+  ok(peerauth.is_steam_exe("/mnt/games/Steam/steamrt64/steamwebhelper"),
+    "custom-root steamrt64 steamwebhelper accepted")
+  ok(peerauth.is_steam_exe("/opt/client/steamrt32/steam"),
+    "custom-root steamrt32 steam accepted")
+  ok(not peerauth.is_steam_exe("/tmp/steam/steamwebhelper"),
+    "generic /steam/ directory outside a Steam tree refused")
   ok(not peerauth.is_steam_exe("/tmp/evil"), "unrelated binary refused")
   ok(not peerauth.is_steam_exe("/tmp/steamwebhelper-evil"),
     "lookalike suffix refused")
